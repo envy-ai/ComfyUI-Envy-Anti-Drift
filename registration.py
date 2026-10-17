@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Bart
 
+import math
+import statistics
+
 import torch
+import torch.nn.functional as F
 
 
 def match_background_color(prediction, reference, mask):
@@ -94,60 +98,100 @@ def _translation(reference, prediction, unmasked):
             other = scores.clone()
             other[max(0, y - 1):y + 2, max(0, x - 1):x + 2] = -2
             next_peak = other.max()
-            if peak - zero_score <= max(1e-4, 0.2 * (1 - zero_score)) or peak - next_peak <= max(1e-4, 0.2 * (1 - next_peak)):
+            if peak - next_peak <= max(1e-4, 0.2 * (1 - next_peak)):
+                continue
+            fractions = []
+            peak_value = peak.item()
+            refined_peak = peak_value
+            for before, after in ((scores[y - 1, x], scores[y + 1, x]), (scores[y, x - 1], scores[y, x + 1])):
+                before, after = before.item(), after.item()
+                curvature = before - 2 * peak_value + after
+                fraction = (before - after) / (2 * curvature) if before > -1 and after > -1 and curvature < -1e-6 else 0
+                if abs(fraction) > 0.5:
+                    fraction = 0
+                gain = (after - before) * fraction / 4
+                if gain <= max(1e-6, 0.05 * (1 - peak_value)):
+                    fraction = 0
+                    gain = 0
+                refined_peak += gain
+                fractions.append(fraction)
+            if refined_peak - zero_score <= max(1e-6, 0.2 * (1 - zero_score)):
                 continue
             offset = (y - center, x - center)
-            votes[offset] = votes.get(offset, 0) + 1
+            votes.setdefault(offset, []).append((offset[0] + fractions[0], offset[1] + fractions[1]))
     if not votes:
         return 0, 0
-    offset, support = max(votes.items(), key=lambda item: item[1])
-    if support < 3 or support * 2 <= eligible_tiles:
+    _, refinements = max(votes.items(), key=lambda item: len(item[1]))
+    if len(refinements) < 3 or len(refinements) * 2 <= eligible_tiles:
         return 0, 0
-    return offset
+    dy = statistics.median(item[0] for item in refinements)
+    dx = statistics.median(item[1] for item in refinements)
+    return (dy, dx) if math.hypot(dy, dx) > 0.05 else (0, 0)
 
 
-def register_prediction(reference, prediction, binary_mask=None):
-    """Align each prediction to the first reference image; return pixels and reliable support."""
+def estimate_translation(reference, prediction, exclusion_mask=None):
     batch, height, width, _ = prediction.shape
-    aligned = prediction.clone()
-    reliable = torch.ones((batch, height, width, 1), dtype=torch.bool, device=prediction.device)
     source_luma = reference[0].float().mean(dim=-1)
+    offsets = []
     for index in range(batch):
-        available = torch.ones((height, width), dtype=torch.bool, device=prediction.device) if binary_mask is None else ~binary_mask[index, ..., 0]
-        dy, dx = _translation(source_luma, prediction[index].float().mean(dim=-1), available)
+        available = torch.ones((height, width), dtype=torch.bool, device=prediction.device) if exclusion_mask is None else ~exclusion_mask[index, ..., 0]
+        offsets.append(_translation(source_luma, prediction[index].float().mean(dim=-1), available))
+    return offsets
+
+
+def warp_image(image, offsets, mode="bilinear"):
+    batch, height, width, _ = image.shape
+    warped = torch.zeros_like(image)
+    grid_dtype = torch.float64 if image.dtype == torch.float64 else torch.float32
+    coverage = torch.zeros((batch, height, width, 1), dtype=grid_dtype, device=image.device)
+    for index, (dy, dx) in enumerate(offsets):
+        if float(dy).is_integer() and float(dx).is_integer():
+            dy, dx = int(dy), int(dx)
+            source_y = slice(max(0, -dy), min(height, height - dy))
+            source_x = slice(max(0, -dx), min(width, width - dx))
+            target_y = slice(max(0, dy), min(height, height + dy))
+            target_x = slice(max(0, dx), min(width, width + dx))
+            warped[index, source_y, source_x] = image[index, target_y, target_x]
+            coverage[index, source_y, source_x] = 1
+            continue
+        y = torch.arange(height, device=image.device, dtype=grid_dtype) + dy
+        x = torch.arange(width, device=image.device, dtype=grid_dtype) + dx
+        grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
+        grid = torch.stack(((grid_x + 0.5) * (2 / width) - 1, (grid_y + 0.5) * (2 / height) - 1), dim=-1)[None]
+        pixels = image[index:index + 1].movedim(-1, 1).to(grid_dtype)
+        warped[index] = F.grid_sample(pixels, grid, mode=mode, align_corners=False).movedim(1, -1)[0].to(image.dtype)
+        coverage[index] = F.grid_sample(torch.ones((1, 1, height, width), dtype=grid_dtype, device=image.device), grid, mode=mode, align_corners=False).movedim(1, -1)[0]
+    return warped, coverage
+
+
+def shift_mask(mask, offsets, mode="nearest"):
+    warped, _ = warp_image(mask.float() if mask.dtype == torch.bool else mask, offsets, mode)
+    return warped > 0.5 if mask.dtype == torch.bool else warped
+
+
+def apply_translation(image, offsets, reference, edit_mask):
+    batch, height, width, _ = image.shape
+    shifted, coverage = warp_image(image, offsets)
+    translated = shifted.clone()
+    displayed_mask = edit_mask.clone()
+    for index, (dy, dx) in enumerate(offsets):
         if dy == 0 and dx == 0:
             continue
-        source_y = slice(max(0, -dy), min(height, height - dy))
-        source_x = slice(max(0, -dx), min(width, width - dx))
-        target_y = slice(max(0, dy), min(height, height + dy))
-        target_x = slice(max(0, dx), min(width, width + dx))
-        shifted = torch.empty_like(prediction[index])
-        shifted[source_y, source_x] = prediction[index, target_y, target_x]
-        valid = torch.zeros((height, width), dtype=torch.bool, device=prediction.device)
-        valid[source_y, source_x] = True
-        shifted_available = torch.zeros_like(valid)
-        shifted_available[source_y, source_x] = available[target_y, target_x]
-        background = valid & available & shifted_available
-        fill = match_background_color(reference, shifted[None], (~background)[None, ..., None])[0]
-        shifted[~valid] = fill[~valid]
-        for distance in (1, 2):
-            weight = distance / 3
-            if dy > 0:
-                y = height - dy - distance
-                shifted[y] = torch.lerp(fill[y], shifted[y], weight)
-                valid[y] = False
-            elif dy < 0:
-                y = -dy + distance - 1
-                shifted[y] = torch.lerp(fill[y], shifted[y], weight)
-                valid[y] = False
-            if dx > 0:
-                x = width - dx - distance
-                shifted[:, x] = torch.lerp(fill[:, x], shifted[:, x], weight)
-                valid[:, x] = False
-            elif dx < 0:
-                x = -dx + distance - 1
-                shifted[:, x] = torch.lerp(fill[:, x], shifted[:, x], weight)
-                valid[:, x] = False
-        aligned[index] = shifted
-        reliable[index, ..., 0] = valid
-    return aligned, reliable
+        background = (coverage[index, ..., 0] > 0.999) & (edit_mask[index, ..., 0] == 0)
+        fill = match_background_color(reference, shifted[index:index + 1], (~background)[None, ..., None])[0]
+        weight = torch.ones((height, width), dtype=torch.float32, device=image.device)
+        if dy > 0:
+            y = torch.arange(height, device=image.device)
+            weight *= ((height - dy - y) / 3).clamp(0, 1)[:, None]
+        elif dy < 0:
+            y = torch.arange(height, device=image.device)
+            weight *= ((y + dy + 1) / 3).clamp(0, 1)[:, None]
+        if dx > 0:
+            x = torch.arange(width, device=image.device)
+            weight *= ((width - dx - x) / 3).clamp(0, 1)[None, :]
+        elif dx < 0:
+            x = torch.arange(width, device=image.device)
+            weight *= ((x + dx + 1) / 3).clamp(0, 1)[None, :]
+        translated[index] = fill * (1 - coverage[index] * weight[..., None]) + shifted[index] * weight[..., None]
+        displayed_mask[index] *= weight[..., None]
+    return translated, displayed_mask

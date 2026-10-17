@@ -43,6 +43,24 @@ def _translate(image, dy, dx):
     return translated
 
 
+def _fractionally_translate(image, dy, dx):
+    batch, height, width, _ = image.shape
+    y, x = torch.meshgrid(
+        torch.arange(height, dtype=image.dtype),
+        torch.arange(width, dtype=image.dtype),
+        indexing="ij",
+    )
+    grids = []
+    for _ in range(batch):
+        grid_x = (x - dx + 0.5) * (2 / width) - 1
+        grid_y = (y - dy + 0.5) * (2 / height) - 1
+        grids.append(torch.stack((grid_x, grid_y), dim=-1))
+    grid = torch.stack(grids)
+    return torch.nn.functional.grid_sample(
+        image.movedim(-1, 1), grid, mode="bilinear", padding_mode="zeros", align_corners=False
+    ).movedim(1, -1)
+
+
 @pytest.fixture(scope="module")
 def anti_drift():
     import comfy.cli_args
@@ -67,15 +85,12 @@ def test_blend_uses_strict_mean_rgb_threshold_and_unblurred_reference(anti_drift
     at_threshold = torch.full_like(reference, 0.1)
     above_threshold = torch.full_like(reference, 0.1001)
 
-    restored_below, _, _ = anti_drift.blend_prediction(
-        reference, blurred_reference, below_threshold, 0, 10, mask_expand_pixels=0
-    )
-    restored, _, _ = anti_drift.blend_prediction(
-        reference, blurred_reference, at_threshold, 0, 10, mask_expand_pixels=0
-    )
-    kept, _, _ = anti_drift.blend_prediction(
-        reference, blurred_reference, above_threshold, 0, 10, mask_expand_pixels=0
-    )
+    below_mask = anti_drift.detect_mask(below_threshold, blurred_reference, 10, 0)
+    at_mask = anti_drift.detect_mask(at_threshold, blurred_reference, 10, 0)
+    above_mask = anti_drift.detect_mask(above_threshold, blurred_reference, 10, 0)
+    restored_below = anti_drift.compose_prediction(reference, below_threshold, below_mask.float())
+    restored = anti_drift.compose_prediction(reference, at_threshold, at_mask.float())
+    kept = anti_drift.compose_prediction(reference, above_threshold, above_mask.float())
 
     torch.testing.assert_close(restored_below, reference, rtol=0, atol=0)
     torch.testing.assert_close(restored, reference, rtol=0, atol=0)
@@ -89,13 +104,9 @@ def test_mask_expansion_default_is_15_pixels_and_batch_local(anti_drift):
     prediction[0, 20, 21] = 1
     prediction[1, 5, 7] = 1
 
-    _, expanded, _ = anti_drift.blend_prediction(
-        reference, reference, prediction, 0, 50, comparison_blur_pixels=0
-    )
-    _, original, _ = anti_drift.blend_prediction(
-        reference, reference, prediction, 0, 50, mask_expand_pixels=0,
-        comparison_blur_pixels=0,
-    )
+    binary = anti_drift.detect_mask(prediction, reference, 50, 0)
+    expanded = anti_drift.feather_mask(binary, 0, 15, prediction.dtype)
+    original = anti_drift.feather_mask(binary, 0, 0, prediction.dtype)
 
     assert expanded.shape == (2, height, width, 1)
     assert torch.count_nonzero(original[0]) == torch.count_nonzero(original[1]) == 1
@@ -122,14 +133,7 @@ def test_mask_expansion_precedes_gaussian_feathering(anti_drift):
     radius = 3
 
     blurred_reference = anti_drift.blur_image(reference, blur_pixels)
-    _, actual, _ = anti_drift.blend_prediction(
-        reference, blurred_reference, prediction, blur_pixels, 10,
-        mask_expand_pixels=radius, comparison_blur_pixels=blur_pixels,
-    )
-    binary = (
-        (anti_drift.blur_image(prediction, blur_pixels) - blurred_reference)
-        .abs().mean(dim=-1, keepdim=True) > 0.1
-    ).to(prediction.dtype)
+    binary = anti_drift.detect_mask(prediction, blurred_reference, 10, blur_pixels).to(prediction.dtype)
     expanded = torch.nn.functional.max_pool2d(
         binary.movedim(-1, 1), (1, radius * 2 + 1), stride=1,
         padding=(0, radius),
@@ -138,6 +142,7 @@ def test_mask_expansion_precedes_gaussian_feathering(anti_drift):
         expanded, (radius * 2 + 1, 1), stride=1, padding=(radius, 0)
     ).movedim(1, -1)
     expected = anti_drift.blur_image(expanded, blur_pixels)
+    actual = anti_drift.feather_mask(binary, blur_pixels, radius, prediction.dtype)
 
     torch.testing.assert_close(actual, expected)
     assert torch.any((actual > 0) & (actual < 1))
@@ -149,9 +154,9 @@ def test_blurred_comparison_ignores_opposite_high_frequency_texture(anti_drift):
     prediction = (1 - pattern)[None, :, :, None].expand_as(reference)
     blurred_reference = anti_drift.blur_image(reference, 2)
 
-    result, mask, _ = anti_drift.blend_prediction(
-        reference, blurred_reference, prediction, 2, 10, mask_expand_pixels=0
-    )
+    binary = anti_drift.detect_mask(prediction, blurred_reference, 10, 2)
+    mask = anti_drift.feather_mask(binary, 2, 0, prediction.dtype)
+    result = anti_drift.compose_prediction(reference, prediction, mask)
 
     torch.testing.assert_close(
         result[:, 60:68, 60:68], reference[:, 60:68, 60:68], rtol=0, atol=0
@@ -166,14 +171,8 @@ def test_reference_uses_first_image_and_broadcasts_to_prediction_batch(anti_drif
     prediction = torch.zeros((3, 2, 3, 3), dtype=torch.float64)
 
     reference = anti_drift.prepare_reference(image1, prediction)
-    result, _, _ = anti_drift.blend_prediction(
-        reference,
-        torch.zeros_like(reference),
-        prediction,
-        0,
-        100,
-        mask_expand_pixels=0,
-    )
+    binary = anti_drift.detect_mask(prediction, torch.zeros_like(reference), 100, 0)
+    result = anti_drift.compose_prediction(reference, prediction, binary.to(prediction.dtype))
 
     assert reference.shape == (1, 2, 3, 3)
     assert reference.dtype == prediction.dtype
@@ -237,22 +236,22 @@ def test_registration_recovers_signed_translation_from_unmasked_background(
     reference = _textured_image(height, width, seed=9)
     edited = reference.clone()
     conflict = _textured_image(height, width, seed=22) * 2
-    edited[:, 48:144, 48:144] = conflict[:, 48:144, 48:144]
+    edited[:, 60:132, 60:132] = conflict[:, 60:132, 60:132]
     prediction = _translate(edited, dy, dx)
     edit_mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
     edit_mask[:, 48:144, 48:144] = True
 
-    aligned, valid = anti_drift.register_prediction(reference, prediction, edit_mask)
+    offsets = anti_drift.estimate_translation(reference, prediction, edit_mask)
 
-    assert valid.shape == (1, height, width, 1)
-    assert not valid.all()
-    background = valid & ~edit_mask
+    assert offsets == [(dy, dx)]
+    aligned, coverage = anti_drift.warp_image(prediction, offsets)
+    background = (coverage > 0.999) & ~edit_mask
     assert background.sum() > 1000
     torch.testing.assert_close(
         aligned[background.expand_as(aligned)],
         reference[background.expand_as(reference)],
         rtol=0,
-        atol=0,
+        atol=1e-6,
     )
 
 
@@ -265,18 +264,19 @@ def test_alignment_bootstraps_a_first_pass_without_an_existing_mask(anti_drift):
     edited[:, 48:144, 48:144] = 0.95
     prediction = _translate(edited, 2, -2)
 
-    aligned, valid = anti_drift.align_prediction(
+    offsets = anti_drift.alignment_offsets(
         reference, prediction, anti_drift.blur_image(reference, 2), 5, 2
     )
+    aligned, coverage = anti_drift.warp_image(prediction, offsets)
 
-    assert not valid.all()
-    background = valid & ~edit_mask
+    assert offsets[0] == pytest.approx((2.0, -2.0), abs=0.05)
+    background = (coverage > 0.999) & ~edit_mask
     assert background.sum() > 1000
     torch.testing.assert_close(
         aligned[background.expand_as(aligned)],
         reference[background.expand_as(reference)],
         rtol=0,
-        atol=0,
+        atol=0.02,
     )
 
 
@@ -287,16 +287,39 @@ def test_registration_leaves_no_shift_flat_and_ambiguous_images_unchanged(anti_d
     ambiguous = stripes.expand(1, 192, 192, 3).clone()
 
     for image in (textured, flat, ambiguous):
-        aligned, valid = anti_drift.register_prediction(image, image.clone())
-        torch.testing.assert_close(aligned, image, rtol=0, atol=0)
-        assert valid.all()
+        assert anti_drift.estimate_translation(image, image.clone()) == [(0, 0)]
 
     # Periodic stripes have equally good nonzero translations, so they cannot
     # identify a unique shift.
     periodic_reference = torch.roll(ambiguous, shifts=4, dims=2)
-    aligned, valid = anti_drift.register_prediction(periodic_reference, ambiguous)
-    torch.testing.assert_close(aligned, ambiguous, rtol=0, atol=0)
-    assert valid.all()
+    assert anti_drift.estimate_translation(periodic_reference, ambiguous) == [(0, 0)]
+
+
+def test_subpixel_estimates_recalculate_masks_only_above_one_third_pixel(anti_drift):
+    reference = _textured_image(192, 192, seed=103)
+    generator = torch.Generator().manual_seed(104)
+    fine_texture = torch.rand(reference.shape, generator=generator) * 0.04 - 0.02
+    reference = (reference + fine_texture).clamp(0, 1)
+    prediction = torch.cat((
+        _fractionally_translate(reference, 0.0, 0.2),
+        _fractionally_translate(reference, 0.0, 0.4),
+    ))
+    offsets = anti_drift.estimate_translation(reference, prediction)
+    assert offsets[0] == pytest.approx((0.0, 0.2), abs=0.12)
+    assert offsets[1] == pytest.approx((0.0, 0.4), abs=0.12)
+
+    masks, recalculate = anti_drift.output_binary_mask(
+        reference, prediction, anti_drift.blur_image(reference, 0), 0.5, 0, offsets
+    )
+    raw_mask = anti_drift.detect_mask(
+        prediction, anti_drift.blur_image(reference, 0), 0.5, 0
+    )
+
+    assert recalculate == [False, True]
+    assert masks.shape == (2, 192, 192, 1)
+    raw_false_positives = raw_mask[1, 32:160, 32:160].sum()
+    aligned_false_positives = masks[1, 32:160, 32:160].sum()
+    assert raw_false_positives > aligned_false_positives
 
 
 def test_registration_does_not_use_content_inside_the_edit_mask(anti_drift):
@@ -308,10 +331,7 @@ def test_registration_does_not_use_content_inside_the_edit_mask(anti_drift):
     shifted_reference = _translate(reference, 6, -5)
     prediction[:, 48:144, 48:144] = shifted_reference[:, 48:144, 48:144]
 
-    aligned, valid = anti_drift.register_prediction(reference, prediction, mask)
-
-    torch.testing.assert_close(aligned, prediction, rtol=0, atol=0)
-    assert valid.all()
+    assert anti_drift.estimate_translation(reference, prediction, mask) == [(0, 0)]
 
 
 def test_registration_is_batch_local_and_edge_fill_uses_valid_histogram_support(
@@ -324,29 +344,32 @@ def test_registration_is_batch_local_and_edge_fill_uses_valid_histogram_support(
     colored = reference * transform + offset
     prediction = torch.cat((_translate(colored, 5, -4), _translate(colored, -5, 4)))
 
-    aligned, valid = anti_drift.register_prediction(reference, prediction)
-
-    assert valid.shape == (2, height, width, 1)
-    assert not valid.all()
+    offsets = anti_drift.estimate_translation(reference, prediction)
+    aligned, coverage = anti_drift.warp_image(prediction, offsets)
+    assert offsets == [(5, -4), (-5, 4)]
+    assert coverage.shape == (2, height, width, 1)
+    assert not coverage.all()
     for batch_index in range(2):
-        overlap = valid[batch_index].expand_as(reference[0])
+        overlap = (coverage[batch_index] > 0.999).expand_as(reference[0])
         torch.testing.assert_close(
             aligned[batch_index][overlap], colored[0][overlap], rtol=0, atol=0
         )
-    # The introduced zero border cannot affect the source-to-generated fit.
-    torch.testing.assert_close(
-        aligned[0, 80, -1], colored[0, 80, -1], rtol=0, atol=0
+    composite, _ = anti_drift.apply_translation(
+        prediction, offsets, reference, torch.zeros((2, height, width, 1))
     )
-    torch.testing.assert_close(
-        aligned[1, 80, 0], colored[0, 80, 0], rtol=0, atol=0
-    )
+    for batch_index, column in ((0, 0), (1, -1)):
+        matched = anti_drift.match_background_color(
+            reference, aligned[batch_index:batch_index + 1],
+            (coverage[batch_index:batch_index + 1] > 0.999).logical_not(),
+        )
+        torch.testing.assert_close(
+            composite[batch_index, 80, column], matched[0, 80, column], rtol=0, atol=1e-6
+        )
 
 
 def test_registration_feathers_exposed_edge_and_fills_holes_from_source(
-    anti_drift, monkeypatch
+    anti_drift
 ):
-    registration = importlib.import_module(f"{anti_drift.__package__}.registration")
-    monkeypatch.setattr(registration, "_translation", lambda *args: (0, 3))
     height, width = 20, 24
     reference = torch.zeros((1, height, width, 3))
     reference[:] = torch.tensor([0.2, 0.3, 0.4])
@@ -354,32 +377,102 @@ def test_registration_feathers_exposed_edge_and_fills_holes_from_source(
     generated[:] = torch.tensor([0.7, 0.8, 0.9])
     prediction = _translate(generated, 0, 3)
 
-    aligned, valid = anti_drift.register_prediction(reference, prediction)
+    aligned, displayed_mask = anti_drift.apply_translation(
+        prediction, [(0, 3)], reference, torch.ones((1, height, width, 1))
+    )
 
     torch.testing.assert_close(aligned[0, 8, width - 4], torch.tensor([0.36666667, 0.46666667, 0.56666667]))
     torch.testing.assert_close(aligned[0, 8, width - 5], torch.tensor([0.53333336, 0.6333333, 0.73333335]))
     torch.testing.assert_close(aligned[0, 8, width - 2], reference[0, 8, width - 2], rtol=0, atol=0)
-    assert not valid[0, 8, width - 4, 0]
-    assert not valid[0, 8, width - 5, 0]
-    assert not valid[0, 8, width - 3:, 0].any()
+    torch.testing.assert_close(displayed_mask[0, 8, width - 4, 0], torch.tensor(1 / 3))
+    torch.testing.assert_close(displayed_mask[0, 8, width - 5, 0], torch.tensor(2 / 3))
+    assert not displayed_mask[0, 8, width - 3:, 0].any()
 
 
-def test_final_alignment_keeps_source_exact_outside_edit_mask(anti_drift):
+def test_final_alignment_moves_restored_background_and_edit_once(anti_drift):
     height = width = 192
     reference = _textured_image(height, width, seed=95)
+    source_feature = torch.tensor([1.0, 0.0, 1.0])
+    reference[:, 29:32, 29:32] = source_feature
     edited = reference.clone()
     mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
     mask[:, 60:132, 60:132] = True
-    edited[:, 90:105, 90:105] = 0.95
+    edited[:, 90:95, 90:95] = 0.95
     prediction = _translate(edited, 4, 5)
 
     final = anti_drift.finalize_image(
         reference, prediction, mask, 0, 100, 0, comparison_blur_pixels=0,
-        align_background=True,
+        align_background=True, dont_unmask_pixels=True,
     )
 
-    assert torch.equal(final[~mask[..., 0]], reference[~mask[..., 0]])
+    torch.testing.assert_close(final[0, 26, 25], source_feature, rtol=0, atol=1e-5)
+    assert final[0, 30, 30].mean() < 0.7
     assert final[0, 92, 92].mean() > 0.8
+    assert final[0, 98, 98].mean() < 0.8
+
+
+def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
+    anti_drift, monkeypatch
+):
+    import comfy.model_management
+    import comfy.model_prefetch
+
+    monkeypatch.setattr(comfy.model_prefetch, "pause_malloc_graph", nullcontext)
+    monkeypatch.setattr(comfy.model_management, "load_models_gpu", lambda *args, **kwargs: None)
+    reference = _textured_image(192, 192, seed=117)
+    edited = reference.clone()
+    edited[:, 84:96, 84:96] = 0.98
+    predictions = [_translate(edited, 5, -4), _translate(edited, -3, 2)]
+    decoded = []
+    encoded = []
+
+    class VAE:
+        def decode(self, samples):
+            image = predictions[len(decoded)]
+            decoded.append(image)
+            return image
+
+        def encode(self, image):
+            encoded.append(image.clone())
+            return torch.zeros((1, 4, 2, 2))
+
+    class Model:
+        def process_latent_out(self, samples):
+            return samples
+
+        def process_latent_in(self, samples):
+            return samples
+
+    correction = anti_drift.AntiDriftCorrection(
+        reference, VAE(), 0, 10, 0, dont_unmask_pixels=True,
+        comparison_blur_pixels=4, align_background=True,
+    )
+    _enable_corrections(correction, 2)
+    correction.models = [object()]
+    correction.memory_required = 1
+    correction.minimum_memory_required = 1
+    estimated_offsets = []
+    estimate = anti_drift.alignment_offsets
+
+    def capture_offsets(*args, **kwargs):
+        offsets = estimate(*args, **kwargs)
+        estimated_offsets.append(offsets)
+        return offsets
+
+    monkeypatch.setattr(anti_drift, "alignment_offsets", capture_offsets)
+    args = {"denoised": torch.zeros((1, 4, 2, 2)), "model": Model(), "sigma": torch.tensor([1.0])}
+    correction(args)
+    first_mask = correction.last_binary_mask.clone()
+    correction(args)
+
+    assert estimated_offsets == [[(5, -4)], [(-3, 2)]]
+    assert len(decoded) == len(encoded) == 2
+    assert first_mask[0, 90, 90, 0]
+    assert correction.last_binary_mask[0, 90, 90, 0]
+    assert torch.all(correction.last_binary_mask[first_mask])
+    for image, displaced_center in ((encoded[0], (99, 81)), (encoded[1], (82, 97))):
+        assert image[0, 90, 90].mean() > 0.8
+        assert image[0, displaced_center[0], displaced_center[1]].mean() < 0.8
 
 
 def test_disabled_alignment_keeps_the_legacy_final_composite(anti_drift, monkeypatch):
@@ -390,7 +483,7 @@ def test_disabled_alignment_keeps_the_legacy_final_composite(anti_drift, monkeyp
     def unexpected_alignment(*args, **kwargs):
         raise AssertionError("disabled alignment must not register the prediction")
 
-    monkeypatch.setattr(anti_drift, "align_prediction", unexpected_alignment)
+    monkeypatch.setattr(anti_drift, "alignment_offsets", unexpected_alignment)
     final = anti_drift.finalize_image(
         reference, prediction, mask, 0, 5, 0, align_background=False
     )
@@ -823,10 +916,11 @@ def test_sampler_returns_eval_major_corrected_and_feathered_mask_panels(
     expected_frames = []
     has_fractional_mask = False
     for prediction in predictions[:2]:
-        corrected, mask, _ = anti_drift.blend_prediction(
-            reference[:1], anti_drift.blur_image(reference[:1], 1), prediction, 1, 10,
-            mask_expand_pixels=0, comparison_blur_pixels=1,
+        binary = anti_drift.detect_mask(
+            prediction, anti_drift.blur_image(reference[:1], 1), 10, 1
         )
+        mask = anti_drift.feather_mask(binary, 1, 0, prediction.dtype)
+        corrected = anti_drift.compose_prediction(reference[:1], prediction, mask)
         has_fractional_mask |= bool(torch.any((mask > 0) & (mask < 1)))
         for batch_index in range(batch):
             expected_frames.append((corrected[batch_index], mask[batch_index].expand(-1, -1, 3)))
@@ -1355,14 +1449,12 @@ def test_comparison_blur_changes_detection_not_feathering_or_cached_reference(
     prediction = reference.clone()
     prediction[:, :, width // 2] = 0.8
 
-    detected, feathered, binary = anti_drift.blend_prediction(
-        reference, anti_drift.blur_image(reference, 2), prediction, 6, 5, 15,
-        comparison_blur_pixels=2,
-    )
-    restored, no_feather, binary_suppressed = anti_drift.blend_prediction(
-        reference, anti_drift.blur_image(reference, 6), prediction, 6, 5, 15,
-        comparison_blur_pixels=6,
-    )
+    binary = anti_drift.detect_mask(prediction, anti_drift.blur_image(reference, 2), 5, 2)
+    feathered = anti_drift.feather_mask(binary, 6, 15, prediction.dtype)
+    detected = anti_drift.compose_prediction(reference, prediction, feathered)
+    binary_suppressed = anti_drift.detect_mask(prediction, anti_drift.blur_image(reference, 6), 5, 6)
+    no_feather = anti_drift.feather_mask(binary_suppressed, 6, 15, prediction.dtype)
+    restored = anti_drift.compose_prediction(reference, prediction, no_feather)
 
     assert binary[0, height // 2, width // 2, 0]
     assert not binary_suppressed.any()
