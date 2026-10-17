@@ -308,6 +308,7 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     all_inputs = {**schema, **anti_drift.EnvyKSamplerAdvancedAntiDrift.INPUT_TYPES().get("optional", {})}
     assert all_inputs["comparison_filter"][1]["default"] == "gaussian"
     assert all_inputs["comparison_color_tolerance_percent"][1]["default"] == 10.0
+    assert all_inputs["mask_growth"][1]["default"] is True
     assert "align_background" not in all_inputs
     assert "use_ecc_alignment" not in all_inputs
     assert "feather" in schema["blur_pixels"][1]["tooltip"].lower()
@@ -320,6 +321,10 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     assert defaults.comparison_blur_pixels == 2.0
     assert defaults.comparison_filter == "gaussian"
     assert defaults.comparison_color_tolerance_percent == 10.0
+    assert defaults.mask_growth is True
+    assert defaults.growth_threshold_percent == 2.0
+    assert defaults.min_seed_area == 128
+    assert defaults.max_growth_distance == 64
 
 
 @pytest.mark.parametrize("sy,sx,dy,dx", [(1.018, 0.986, 2.4, -3.2), (0.982, 1.014, -2.2, 3.1)])
@@ -669,6 +674,69 @@ def test_small_mask_components_use_four_connectivity_per_batch(anti_drift):
     cleaned = anti_drift.remove_small_mask_components(boundary, default)
     assert not cleaned[0, 0].any()
     assert cleaned[0, 2].sum() == 8
+
+
+def test_hysteresis_growth_is_four_connected_bounded_and_per_batch(anti_drift):
+    reference = torch.zeros((2, 12, 16, 3))
+    prediction = reference.clone()
+    prediction[0, 5, 2:5] = 0.2  # Three-pixel strong seed.
+    prediction[0, 5, 5:10] = 0.04  # Weak extension; cap stops it at x=7.
+    prediction[0, 4, 1] = 0.04  # Diagonal touch is not 4-connected.
+    prediction[0, 2, 3] = 0.04  # Disconnected weak noise.
+    prediction[1, 5, 2] = 0.2  # Small component is removed independently.
+    prediction[1, 5, 3:7] = 0.04
+
+    grown = anti_drift.detect_grown_mask(
+        prediction, reference, 10, 0, "gaussian", 10, 2, 2, 3
+    )
+
+    assert grown.dtype == torch.bool
+    assert grown[0, 5, 2:8, 0].all()
+    assert not grown[0, 5, 8:, 0].any()
+    assert not grown[0, 4, 1, 0]
+    assert not grown[0, 2, 3, 0]
+    assert not grown[1].any()
+
+
+def test_hysteresis_growth_valid_coverage_and_strong_seed_retention(anti_drift):
+    reference = torch.zeros((1, 8, 14, 3))
+    prediction = reference.clone()
+    prediction[0, 3, 1:3] = 0.2
+    prediction[0, 3, 3:8] = 0.04
+    prediction[0, 3, 5] = 0.4  # Invalid exposed pixel must not seed or bridge.
+    valid = torch.ones((1, 8, 14, 1), dtype=torch.bool)
+    valid[0, 3, 5, 0] = False
+    grown = anti_drift.detect_grown_mask(
+        prediction, reference, 10, 0, "gaussian", 10, 2, 2, 64, valid
+    )
+    assert grown[0, 3, 1:5, 0].all()
+    assert not grown[0, 3, 5:, 0].any()
+
+    # Strong seeds remain even when the weak threshold is higher than the seed.
+    seed_only = anti_drift.detect_grown_mask(
+        prediction, reference, 10, 0, "gaussian", 10, 30, 2, 0, valid
+    )
+    assert seed_only[0, 3, 1:3, 0].all()
+    assert seed_only.sum() == 2
+
+
+def test_disabled_hysteresis_keeps_single_threshold_output_exact(anti_drift, monkeypatch):
+    reference = torch.zeros((1, 9, 11, 3))
+    prediction = reference.clone()
+    prediction[:, 3:5, 4:6] = 0.2
+    prediction[:, 7, 8] = 0.03
+    blurred = anti_drift.blur_image(reference, 0)
+    expected = anti_drift.shift_mask(anti_drift.detect_mask(prediction, blurred, 10, 0), [(1, 1, 0, 0)])
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("disabled growth must use the original threshold detector")
+
+    monkeypatch.setattr(anti_drift, "detect_grown_mask", fail_if_called)
+    actual, recalculated = anti_drift.output_binary_mask(
+        reference, prediction, blurred, 10, 0, [(1, 1, 0, 0)], mask_growth=False
+    )
+    assert torch.equal(actual, expected)
+    assert recalculated == [False]
 
 
 def test_final_mask_cleanup_precedes_expansion_and_updates_diagnostics(
@@ -1199,6 +1267,7 @@ def test_sampler_returns_eval_major_corrected_and_feathered_mask_panels(
         return_with_leftover_noise="disable", image1=reference, vae=VAE(),
         blur_pixels=1, threshold_percent=10, mask_expand_pixels=0,
         comparison_blur_pixels=1,
+        mask_growth=False,
     )
 
     assert result_latent is native_output
@@ -1619,7 +1688,7 @@ def test_empty_sparse_steps_skip_intermediate_correction_and_final_mask_falls_ba
     prediction[:, 0, 0] = 1
     final = anti_drift.finalize_image(
         torch.zeros_like(prediction), prediction, None, 0, 10, 0,
-        comparison_blur_pixels=0, min_mask_area=0,
+        comparison_blur_pixels=0, min_mask_area=0, mask_growth=False,
     )
     assert final.dtype == torch.float32 and final.device.type == "cpu"
     torch.testing.assert_close(final[0, 0, 0], torch.ones(3))
@@ -1695,7 +1764,7 @@ def test_final_registration_uses_unexpanded_previous_binary_with_redetection(
     diagnostics = []
     composite = anti_drift.finalize_image(
         reference, prediction, previous, 4, 10, 15, comparison_blur_pixels=0,
-        dont_unmask_pixels=True, diagnostic_output=diagnostics,
+        dont_unmask_pixels=True, diagnostic_output=diagnostics, mask_growth=False,
     )
 
     expected_exclusion = previous | current
@@ -1749,7 +1818,7 @@ def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkey
     denoised = torch.zeros((2, 4, height, width))
     retained = anti_drift.AntiDriftCorrection(
         reference, VAE([first, reference, next_prediction, next_prediction]), 0, 10, 1,
-        dont_unmask_pixels=True, comparison_blur_pixels=0, min_mask_area=0,
+        dont_unmask_pixels=True, comparison_blur_pixels=0, min_mask_area=0, mask_growth=False,
     )
     _enable_corrections(retained, 3)
     for _ in range(3):
@@ -1774,7 +1843,7 @@ def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkey
 
     shrinking = anti_drift.AntiDriftCorrection(
         reference, VAE([first, reference, next_prediction]), 0, 10, 1,
-        dont_unmask_pixels=False, comparison_blur_pixels=0, min_mask_area=0,
+        dont_unmask_pixels=False, comparison_blur_pixels=0, min_mask_area=0, mask_growth=False,
     )
     _enable_corrections(shrinking, 2)
     for _ in range(2):
@@ -1824,7 +1893,7 @@ def test_post_cfg_encodes_color_matched_prediction_over_exact_source_background(
 
     vae = VAE()
     correction = anti_drift.AntiDriftCorrection(
-        reference, vae, 0, 10, 0, comparison_blur_pixels=0, min_mask_area=0,
+        reference, vae, 0, 10, 0, comparison_blur_pixels=0, min_mask_area=0, mask_growth=False,
     )
     _enable_corrections(correction)
     correction.models = [object()]
@@ -1915,7 +1984,7 @@ def test_comparison_blur_changes_detection_not_feathering_or_cached_reference(
             return samples
 
     correction = anti_drift.AntiDriftCorrection(
-        reference, VAE(), 6, 5, 15, comparison_blur_pixels=2,
+        reference, VAE(), 6, 5, 15, comparison_blur_pixels=2, mask_growth=False,
     )
     _enable_corrections(correction)
     correction.models = [object()]
@@ -1931,10 +2000,10 @@ def test_comparison_blur_changes_detection_not_feathering_or_cached_reference(
     torch.testing.assert_close(encoded[-1], detected)
 
     fallback_detected = anti_drift.finalize_image(
-        reference, prediction, None, 6, 5, 15, comparison_blur_pixels=2,
+        reference, prediction, None, 6, 5, 15, comparison_blur_pixels=2, mask_growth=False,
     )
     fallback_suppressed = anti_drift.finalize_image(
-        reference, prediction, None, 6, 5, 15, comparison_blur_pixels=6,
+        reference, prediction, None, 6, 5, 15, comparison_blur_pixels=6, mask_growth=False,
     )
     assert fallback_detected[0, height // 2, width // 2, 0] > 0.7
     assert fallback_suppressed[0, height // 2, width // 2, 0] == reference[0, height // 2, width // 2, 0]
@@ -2078,6 +2147,8 @@ def test_bilateral_correction_caches_reference_filter_and_keeps_vae_call_count(
     correction = anti_drift.AntiDriftCorrection(
         reference, VAE(), 6, 5, 15, comparison_blur_pixels=2,
         comparison_filter="bilateral", comparison_color_tolerance_percent=10,
+        mask_growth=True, growth_threshold_percent=2.5, min_seed_area=129,
+        max_growth_distance=63,
     )
     _enable_corrections(correction, 2)
     correction.models = [object()]
@@ -2091,6 +2162,8 @@ def test_bilateral_correction_caches_reference_filter_and_keeps_vae_call_count(
     cached_reference_calls = []
     comparison_modes = []
     original_detect = anti_drift.detect_mask
+    original_detect_grown = anti_drift.detect_grown_mask
+    growth_options = []
 
     def count_reference_filter(image, *args):
         if correction.comparison_reference is not None and image.data_ptr() == correction.comparison_reference.data_ptr():
@@ -2101,8 +2174,13 @@ def test_bilateral_correction_caches_reference_filter_and_keeps_vae_call_count(
         comparison_modes.append(args[4] if len(args) > 4 else kwargs["comparison_filter"])
         return original_detect(*args, **kwargs)
 
+    def track_growth_options(*args, **kwargs):
+        growth_options.append((args[6:9], args[9] if len(args) > 9 else kwargs.get("valid")))
+        return original_detect_grown(*args, **kwargs)
+
     monkeypatch.setattr(anti_drift, "filter_comparison_image", count_reference_filter)
     monkeypatch.setattr(anti_drift, "detect_mask", track_comparison_mode)
+    monkeypatch.setattr(anti_drift, "detect_grown_mask", track_growth_options)
     args = {
         "denoised": torch.zeros((1, 4, height, width)),
         "model": Model(), "sigma": torch.tensor([1.0]),
@@ -2115,12 +2193,17 @@ def test_bilateral_correction_caches_reference_filter_and_keeps_vae_call_count(
         comparison_blur_pixels=2, comparison_filter="bilateral",
         comparison_color_tolerance_percent=10,
         comparison_reference=correction.comparison_reference,
+        mask_growth=True, growth_threshold_percent=2.5, min_seed_area=129,
+        max_growth_distance=63,
     )
 
     assert len(cached_reference_calls) == 1
     assert correction.blurred_reference is cached
     assert len(decoded) == len(encoded) == 3
     assert comparison_modes and set(comparison_modes) == {"bilateral"}
+    assert growth_options
+    assert all(options == (2.5, 129, 63) for options, _ in growth_options)
+    assert any(valid is not None for _, valid in growth_options)
     assert final.shape == prediction.shape
     assert torch.isfinite(final).all()
     binary = torch.zeros((1, height, width, 1), dtype=torch.bool)
