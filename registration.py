@@ -116,10 +116,6 @@ def estimate_alignment(reference, prediction, exclusion_mask=None):
     return transforms
 
 
-def invert_alignment(transforms):
-    return [(1 / sy, 1 / sx, -dy / sy, -dx / sx) for sy, sx, dy, dx in transforms]
-
-
 def alignment_displacement(transforms, height, width):
     return [max(math.hypot((sy - 1) * y + dy, (sx - 1) * x + dx)
                 for y in (0, height - 1) for x in (0, width - 1))
@@ -163,12 +159,14 @@ def apply_alignment(image, transforms, reference, edit_mask):
     for index, transform in enumerate(transforms):
         if transform == (1.0, 1.0, 0.0, 0.0):
             continue
+        valid_coverage = coverage[index] > 0
+        pixels = shifted[index] / torch.where(valid_coverage, coverage[index], 1)
         background = (coverage[index, ..., 0] > 0.999) & (edit_mask[index, ..., 0] == 0)
-        fill = match_background_color(reference, shifted[index:index + 1], (~background)[None, ..., None])[0]
+        fill = match_background_color(reference, pixels[None], (~background)[None, ..., None])[0]
         invalid = (coverage[index, ..., 0] <= 0.999).float()[None, None]
         one_pixel = F.max_pool2d(invalid, 3, stride=1, padding=1)
         two_pixels = F.max_pool2d(one_pixel, 3, stride=1, padding=1)
         ramp = 1 - (one_pixel + two_pixels)[0, 0] / 3
-        translated[index] = fill * (1 - coverage[index] * ramp[..., None]) + shifted[index] * ramp[..., None]
-        displayed_mask[index] *= ramp[..., None]
+        translated[index] = torch.where(valid_coverage, pixels, fill)
+        displayed_mask[index] *= coverage[index] * ramp[..., None]
     return translated, displayed_mask

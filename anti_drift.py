@@ -17,7 +17,7 @@ import comfy.utils
 import latent_preview
 from nodes import KSamplerAdvanced
 
-from .registration import alignment_displacement, apply_alignment, estimate_alignment, invert_alignment, match_background_color, shift_mask, warp_image
+from .registration import alignment_displacement, apply_alignment, estimate_alignment, match_background_color, shift_mask, warp_image
 
 
 def blur_image(image, blur_pixels):
@@ -172,10 +172,8 @@ def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_perce
         else:
             mask_modes.append("redetected+retained" if dont_unmask_pixels else "redetected")
     output_mask = feather_mask(binary_mask, blur_pixels, mask_expand_pixels, prediction.dtype)
-    raw_mask = shift_mask(output_mask, invert_alignment(transforms), mode="bilinear")
-    composite = compose_prediction(reference, prediction, raw_mask)
-    display_mask = shift_mask(raw_mask, transforms, mode="bilinear")
-    composite, display_mask = apply_alignment(composite, transforms, reference, display_mask)
+    aligned, display_mask = apply_alignment(prediction, transforms, reference, output_mask)
+    composite = compose_prediction(reference, aligned, display_mask)
     if diagnostic_output is not None:
         diagnostic_output.append(diagnostic_frames(prediction, composite, display_mask, registration_masks[0], binary_mask, transforms, recalculate, mask_modes, "Final"))
     return composite
@@ -257,10 +255,8 @@ class AntiDriftCorrection:
             if retained:
                 binary_mask |= self.retained_mask
             output_mask = feather_mask(binary_mask, self.blur_pixels, self.mask_expand_pixels, prediction.dtype)
-            raw_mask = shift_mask(output_mask, invert_alignment(transforms), mode="bilinear")
-            corrected = compose_prediction(self.reference, prediction, raw_mask)
-            mask = shift_mask(raw_mask, transforms, mode="bilinear")
-            corrected, mask = apply_alignment(corrected, transforms, self.reference, mask)
+            aligned, mask = apply_alignment(prediction, transforms, self.reference, output_mask)
+            corrected = compose_prediction(self.reference, aligned, mask)
             if self.dont_unmask_pixels:
                 self.retained_mask = binary_mask
             self.last_binary_mask = binary_mask

@@ -402,7 +402,7 @@ def test_alignment_displacement_uses_max_corner_and_threshold_is_batch_local(ant
     assert recalculate == [False, True]
 
 
-def test_alignment_inverse_mask_roundtrip_and_integer_warp_preserve_dtype(anti_drift):
+def test_alignment_integer_warp_and_mask_preserve_dtype_and_coordinates(anti_drift):
     height, width = 40, 48
     image = torch.arange(height * width * 3, dtype=torch.float64).reshape(1, height, width, 3)
     transform = [(1.0, 1.0, 3.0, -4.0)]
@@ -414,8 +414,8 @@ def test_alignment_inverse_mask_roundtrip_and_integer_warp_preserve_dtype(anti_d
     binary[:, 16:20, 18:23] = True
     moved = anti_drift.shift_mask(binary, transform)
     assert moved.dtype == torch.bool
-    restored = anti_drift.shift_mask(moved, anti_drift.invert_alignment(transform))
-    assert torch.equal(restored[:, 3:-3, 4:-4], binary[:, 3:-3, 4:-4])
+    assert torch.all(moved[0, 13:17, 22:27, 0])
+    assert moved.sum() == binary.sum()
 
 
 def test_subpixel_alignment_recalculates_masks_at_one_third_pixel_per_batch(anti_drift):
@@ -445,19 +445,27 @@ def test_apply_alignment_fills_and_feathers_exposed_edge(anti_drift):
     generated[:] = torch.tensor([0.7, 0.8, 0.9])
     prediction = _translate(generated, 0, 3)
     transform = [(1.0, 1.0, 0.0, 3.0)]
-    raw_mask = torch.ones((1, height, width, 1))
-    displayed_mask = anti_drift.shift_mask(raw_mask, transform, mode="bilinear")
+    output_mask = torch.ones((1, height, width, 1))
 
     aligned, displayed_mask = anti_drift.apply_alignment(
-        prediction, transform, reference, displayed_mask
+        prediction, transform, reference, output_mask
     )
+    composite = anti_drift.compose_prediction(reference, aligned, displayed_mask)
 
-    torch.testing.assert_close(aligned[0, 8, width - 4], torch.tensor([0.36666667, 0.46666667, 0.56666667]))
-    torch.testing.assert_close(aligned[0, 8, width - 5], torch.tensor([0.53333336, 0.6333333, 0.73333335]))
+    torch.testing.assert_close(aligned[0, 8, width - 4], generated[0, 8, 0], rtol=0, atol=0)
+    torch.testing.assert_close(aligned[0, 8, width - 5], generated[0, 8, 0], rtol=0, atol=0)
     torch.testing.assert_close(aligned[0, 8, width - 2], reference[0, 8, width - 2], rtol=0, atol=0)
     torch.testing.assert_close(displayed_mask[0, 8, width - 4, 0], torch.tensor(1 / 3))
     torch.testing.assert_close(displayed_mask[0, 8, width - 5, 0], torch.tensor(2 / 3))
     assert not displayed_mask[0, 8, width - 3:, 0].any()
+    torch.testing.assert_close(
+        composite[0, 8, width - 4],
+        torch.lerp(reference[0, 8, width - 4], generated[0, 8, 0], torch.tensor(1 / 3)),
+    )
+    torch.testing.assert_close(
+        composite[0, 8, width - 5],
+        torch.lerp(reference[0, 8, width - 5], generated[0, 8, 0], torch.tensor(2 / 3)),
+    )
 
 
 def test_fractional_alignment_of_flat_colors_has_no_dark_edge_seam(anti_drift):
@@ -465,40 +473,48 @@ def test_fractional_alignment_of_flat_colors_has_no_dark_edge_seam(anti_drift):
     reference = torch.full((1, height, width, 3), 0.2)
     prediction = torch.full_like(reference, 0.7)
     transform = [(1.0, 1.0, 0.35, -0.6)]
-    raw_mask = torch.ones((1, height, width, 1))
-    displayed_mask = anti_drift.shift_mask(raw_mask, transform, mode="bilinear")
+    output_mask = torch.ones((1, height, width, 1))
 
     aligned, displayed_mask = anti_drift.apply_alignment(
-        prediction, transform, reference, displayed_mask
+        prediction, transform, reference, output_mask
     )
+    composite = anti_drift.compose_prediction(reference, aligned, displayed_mask)
 
     assert torch.isfinite(aligned).all()
     assert aligned.min() >= 0.2
     assert aligned.max() <= 0.700001
+    assert torch.isfinite(composite).all()
+    assert composite.min() >= 0.2
     assert displayed_mask.min() >= 0
     assert displayed_mask.max() <= 1
 
 
-def test_final_alignment_moves_restored_background_and_edit_once(anti_drift):
-    height = width = 192
+def test_final_alignment_restores_stationary_background_after_warping_edit(anti_drift, monkeypatch):
+    height, width = 144, 160
     reference = _textured_image(height, width, seed=95)
-    source_feature = torch.tensor([1.0, 0.0, 1.0])
-    reference[:, 29:32, 29:32] = source_feature
-    edited = reference.clone()
-    mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
-    mask[:, 60:132, 60:132] = True
-    edited[:, 90:95, 90:95] = 0.95
-    prediction = _translate(edited, 4, 5)
+    transform = (1.03, 0.94, 2.0, -5.0)
+    prediction = _scale_translate(reference, *transform)
+    prediction[:, 73:80, 78:86] = 0.95
+    binary_mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    binary_mask[:, 62:85, 80:106] = True
 
-    final = anti_drift.finalize_image(
-        reference, prediction, mask, 0, 100, 0, comparison_blur_pixels=0,
-        dont_unmask_pixels=True,
+    monkeypatch.setattr(
+        anti_drift, "alignment_transforms", lambda *args, **kwargs: [transform]
+    )
+    monkeypatch.setattr(
+        anti_drift, "output_binary_mask",
+        lambda *args, **kwargs: (binary_mask.clone(), [True]),
     )
 
-    torch.testing.assert_close(final[0, 26, 25], source_feature, rtol=0, atol=1e-5)
-    assert final[0, 30, 30].mean() < 0.7
-    assert final[0, 92, 92].mean() > 0.8
-    assert final[0, 98, 98].mean() < 0.8
+    final = anti_drift.finalize_image(
+        reference, prediction, binary_mask, 0, 100, 0,
+        comparison_blur_pixels=0, dont_unmask_pixels=True,
+    )
+
+    outside_edit = ~binary_mask[0, ..., 0]
+    assert torch.equal(final[0][outside_edit], reference[0][outside_edit])
+    assert final[0, 72, 92].mean() > 0.8
+    assert final[0, 76, 82].mean() < 0.8
 
 
 def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
