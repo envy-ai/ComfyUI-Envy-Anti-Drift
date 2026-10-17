@@ -2,6 +2,8 @@
 
 `Envy KSampler Advanced Anti-Drift` restores small blurred RGB differences to the original image while retaining larger changes. It adds sparse correction steps, mask expansion, optional mask retention, and a final image composite to the native KSampler Advanced controls.
 
+This pack also includes **Text Encode Qwen Image 2.1 (Experimental)**, moved from ComfyUI-Qwen21-Experimental with the same node ID and behavior. See its [encoder documentation](docs/Qwen21TextEncode.md).
+
 Clone [ComfyUI-Envy-Anti-Drift](https://github.com/envy-ai/ComfyUI-Envy-Anti-Drift) into `ComfyUI/custom_nodes` and restart ComfyUI. No additional dependencies are required.
 
 Connect the original image being edited to `image1` and the matching VAE to `vae`. If `image1` contains a batch, its first image is the reference for every sampled latent. When pixel dimensions differ, the reference is aspect-preserving center-cropped and resized with Lanczos to the decoded prediction; matching dimensions avoid resampling. Alpha is ignored.

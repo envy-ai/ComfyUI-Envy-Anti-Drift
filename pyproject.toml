@@ -1,7 +1,7 @@
 [project]
 name = "envy-anti-drift"
-version = "1.0.0"
-description = "Sparse image-editing corrections, mask history, and final source-preserving compositing for ComfyUI."
+version = "1.1.0"
+description = "Image-editing drift correction and experimental Qwen Image 2.1 text encoding for ComfyUI."
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.10"
