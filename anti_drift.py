@@ -98,7 +98,7 @@ def remove_small_mask_components(binary_mask, min_mask_area):
     if min_mask_area <= 1:
         return binary_mask
     cleaned = torch.empty_like(binary_mask)
-    connectivity = np.ones((3, 3), dtype=np.uint8)
+    connectivity = ndimage.generate_binary_structure(2, 1)
     for index in range(binary_mask.shape[0]):
         labels, count = ndimage.label(binary_mask[index, ..., 0].detach().cpu().numpy(), structure=connectivity)
         sizes = np.bincount(labels.ravel(), minlength=count + 1)
@@ -198,7 +198,7 @@ def diagnostic_frames(prediction, composite, display_mask, registration_mask, bi
     return frames
 
 
-def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, dont_unmask_pixels=False, diagnostic_output=None, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, comparison_reference=None, min_mask_area=2):
+def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, dont_unmask_pixels=False, diagnostic_output=None, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, comparison_reference=None, min_mask_area=8):
     if prediction.ndim != 4 or prediction.shape[-1] < 3:
         raise ValueError("Anti-Drift requires an image VAE that decodes to [batch, height, width, RGB].")
     prediction = prediction[..., :3].detach().to(device="cpu", dtype=torch.float32, copy=True)
@@ -239,7 +239,7 @@ def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_perce
 
 
 class AntiDriftCorrection:
-    def __init__(self, image1, vae, blur_pixels, threshold_percent=5.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, start_at_step=0, steps=20, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, min_mask_area=2):
+    def __init__(self, image1, vae, blur_pixels, threshold_percent=5.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, start_at_step=0, steps=20, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, min_mask_area=8):
         self.image1 = image1
         self.vae = vae
         self.blur_pixels = blur_pixels
@@ -369,13 +369,13 @@ class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
         inputs.setdefault("optional", {}).update({
             "comparison_filter": (["gaussian", "bilateral"], {"default": "gaussian", "tooltip": "Choose Gaussian smoothing or edge-preserving bilateral smoothing for RGB difference detection. Mask feathering remains Gaussian."}),
             "comparison_color_tolerance_percent": ("FLOAT", {"default": 10.0, "min": 0.01, "max": 100.0, "step": 0.1, "tooltip": "Bilateral color range standard deviation as a percentage of root-mean-square RGB difference, not a strict cutoff. Lower values preserve weaker edges; higher values smooth across more color differences. threshold_percent still decides which pixels count as edits."}),
-            "min_mask_area": ("INT", {"default": 2, "min": 0, "max": 1000000, "step": 1, "tooltip": "Remove 8-connected binary edit blobs smaller than this many decoded-image pixels before expansion. Diagonal pixels connect; 2 keeps pairs but removes isolated pixels. Zero or one disables cleanup."}),
+            "min_mask_area": ("INT", {"default": 8, "min": 0, "max": 1000000, "step": 1, "tooltip": "Remove binary edit blobs smaller than this many decoded-image pixels before expansion. Only horizontal and vertical neighbors connect; diagonals do not. The default 8 keeps blobs of eight pixels or more. Zero or one disables cleanup."}),
         })
         return inputs
 
     DESCRIPTION = "Corrects selected clean denoised predictions against image1 during one uninterrupted native KSampler Advanced run."
 
-    def sample(self, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, image1, vae, blur_pixels=6.0, threshold_percent=5.0, denoise=1.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, min_mask_area=2):
+    def sample(self, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, image1, vae, blur_pixels=6.0, threshold_percent=5.0, denoise=1.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, min_mask_area=8):
         correction = AntiDriftCorrection(image1, vae, blur_pixels, threshold_percent, mask_expand_pixels, correction_steps, dont_unmask_pixels, start_at_step, steps, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent, min_mask_area)
         try:
             patched_model = model.clone()

@@ -644,20 +644,31 @@ def test_reconstructed_comparison_baseline_cancels_shared_vae_artifact(
     assert (without_baseline[0, outside_edit] - source[0, outside_edit]).abs().mean() > 0.01
 
 
-def test_small_mask_components_use_eight_connectivity_per_batch(anti_drift):
+def test_small_mask_components_use_four_connectivity_per_batch(anti_drift):
     binary = torch.zeros((2, 8, 9, 1), dtype=torch.bool)
     binary[0, 1, 1, 0] = True
     binary[0, 3, 3, 0] = True
     binary[0, 4, 4, 0] = True
     binary[1, 1, 1, 0] = True
+    binary[0, 6, 6:8, 0] = True
 
     unchanged = anti_drift.remove_small_mask_components(binary, 1)
     cleaned = anti_drift.remove_small_mask_components(binary, 2)
 
     assert torch.equal(unchanged, binary)
     assert not cleaned[0, 1, 1, 0] and not cleaned[1, 1, 1, 0]
-    assert cleaned[0, 3, 3, 0] and cleaned[0, 4, 4, 0]
+    assert not cleaned[0, 3, 3, 0] and not cleaned[0, 4, 4, 0]
+    assert cleaned[0, 6, 6, 0] and cleaned[0, 6, 7, 0]
     assert cleaned[0].sum() == 2 and cleaned[1].sum() == 0
+
+    boundary = torch.zeros_like(binary)
+    boundary[0, 0, :7, 0] = True
+    boundary[0, 2, :8, 0] = True
+    default = anti_drift.EnvyKSamplerAdvancedAntiDrift.INPUT_TYPES()["optional"]["min_mask_area"][1]["default"]
+    assert default == 8
+    cleaned = anti_drift.remove_small_mask_components(boundary, default)
+    assert not cleaned[0, 0].any()
+    assert cleaned[0, 2].sum() == 8
 
 
 def test_final_mask_cleanup_precedes_expansion_and_updates_diagnostics(
@@ -668,7 +679,7 @@ def test_final_mask_cleanup_precedes_expansion_and_updates_diagnostics(
     binary = torch.zeros((1, 16, 18, 1), dtype=torch.bool)
     binary[0, 2, 2, 0] = True
     binary[0, 6, 6, 0] = True
-    binary[0, 7, 7, 0] = True
+    binary[0, 6, 7, 0] = True
     transforms = [(1.0, 1.0, 0.0, 0.0)]
     monkeypatch.setattr(anti_drift, "alignment_transforms", lambda *args: (args[6].append(torch.zeros_like(binary)) or transforms))
     original_feather = anti_drift.feather_mask
@@ -687,7 +698,7 @@ def test_final_mask_cleanup_precedes_expansion_and_updates_diagnostics(
 
     cleaned = torch.zeros_like(binary)
     cleaned[0, 6, 6, 0] = True
-    cleaned[0, 7, 7, 0] = True
+    cleaned[0, 6, 7, 0] = True
     assert torch.equal(feather_inputs[0], cleaned)
     _, diagnostic_binary = _diagnostic_pair(diagnostics[0], 0, 0, 2, batch_size=1)
     torch.testing.assert_close(diagnostic_binary[..., 0], cleaned[0, ..., 0].float())
@@ -707,7 +718,7 @@ def test_correction_cleans_retained_binary_mask_before_feathering(
     first_binary = torch.zeros((1, height, width, 1), dtype=torch.bool)
     first_binary[0, 2, 2, 0] = True
     first_binary[0, 5, 5, 0] = True
-    first_binary[0, 6, 6, 0] = True
+    first_binary[0, 5, 6, 0] = True
     next_binary = torch.zeros_like(first_binary)
     next_binary[0, 12, 12, 0] = True
     detected_masks = iter((first_binary, next_binary))
@@ -749,7 +760,7 @@ def test_correction_cleans_retained_binary_mask_before_feathering(
     monkeypatch.setattr(anti_drift, "feather_mask", capture_feather)
     correction = anti_drift.AntiDriftCorrection(
         reference, VAE(), 0, 10, 2, dont_unmask_pixels=True,
-        comparison_blur_pixels=0,
+        comparison_blur_pixels=0, min_mask_area=2,
     )
     _enable_corrections(correction, 2)
     correction.models = [object()]
@@ -764,7 +775,7 @@ def test_correction_cleans_retained_binary_mask_before_feathering(
     correction(args)
 
     assert not first_cleaned[0, 2, 2, 0]
-    assert first_cleaned[0, 5, 5, 0] and first_cleaned[0, 6, 6, 0]
+    assert first_cleaned[0, 5, 5, 0] and first_cleaned[0, 5, 6, 0]
     assert torch.equal(correction.retained_mask, correction.last_binary_mask)
     assert not correction.last_binary_mask[0, 12, 12, 0]
     assert torch.equal(feather_inputs[0], first_cleaned)
