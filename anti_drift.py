@@ -208,7 +208,7 @@ def diagnostic_frames(prediction, composite, display_mask, registration_mask, bi
     return frames
 
 
-def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, dont_unmask_pixels=False, diagnostic_output=None, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, comparison_reference=None, min_mask_area=8):
+def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, dont_unmask_pixels=False, diagnostic_output=None, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, comparison_reference=None, min_mask_area=8, final_layers=None):
     if prediction.ndim != 4 or prediction.shape[-1] < 3:
         raise ValueError("Anti-Drift requires an image VAE that decodes to [batch, height, width, RGB].")
     prediction = prediction[..., :3].detach().to(device="cpu", dtype=torch.float32, copy=True)
@@ -242,7 +242,10 @@ def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_perce
             mask_modes.append("redetected+retained" if dont_unmask_pixels else "redetected")
     output_mask = feather_mask(binary_mask, blur_pixels, mask_expand_pixels, prediction.dtype)
     aligned, display_mask = apply_alignment(prediction, transforms, reference, output_mask)
-    composite = compose_prediction(reference, aligned, display_mask)
+    matched = match_background_color(aligned, reference, display_mask)
+    composite = torch.where(display_mask == 0, reference, torch.lerp(reference, matched, display_mask))
+    if final_layers is not None:
+        final_layers.append((matched, display_mask[..., 0]))
     if diagnostic_output is not None:
         diagnostic_output.append(diagnostic_frames(prediction, composite, display_mask, registration_masks[0], binary_mask, transforms, recalculate, mask_modes, "Final"))
     return composite
@@ -360,8 +363,8 @@ class AntiDriftCorrection:
 
 
 class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
-    RETURN_TYPES = ("LATENT", "IMAGE", "IMAGE")
-    RETURN_NAMES = ("LATENT", "intermediate_steps_and_masks", "final_image")
+    RETURN_TYPES = ("LATENT", "IMAGE", "IMAGE", "IMAGE", "MASK")
+    RETURN_NAMES = ("LATENT", "intermediate_steps_and_masks", "final_image", "raw_final_image", "final_mask")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -398,10 +401,12 @@ class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
                 if comparison_reference is None:
                     comparison_reference = reconstruct_reference(prepare_reference(image1, prediction), vae)
                 final_frames = []
-                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels, dont_unmask_pixels, diagnostic_output=final_frames, comparison_filter=comparison_filter, comparison_color_tolerance_percent=comparison_color_tolerance_percent, comparison_reference=comparison_reference, min_mask_area=min_mask_area)
+                final_layers = []
+                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels, dont_unmask_pixels, diagnostic_output=final_frames, comparison_filter=comparison_filter, comparison_color_tolerance_percent=comparison_color_tolerance_percent, comparison_reference=comparison_reference, min_mask_area=min_mask_area, final_layers=final_layers)
             preview = latent_preview.preview_to_image(final_image[0], do_scale=False)
             comfy.utils.ProgressBar(steps).update_absolute(steps, steps, ("JPEG", preview, None))
             intermediate_steps_and_masks = torch.cat([*correction.intermediate_frames, *final_frames], dim=0)
-            return result[0], intermediate_steps_and_masks, final_image
+            raw_final_image, final_mask = final_layers[0]
+            return result[0], intermediate_steps_and_masks, final_image, raw_final_image, final_mask
         finally:
             correction.clear()

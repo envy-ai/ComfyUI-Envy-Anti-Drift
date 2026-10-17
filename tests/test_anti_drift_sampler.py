@@ -1192,7 +1192,7 @@ def test_sampler_returns_eval_major_corrected_and_feathered_mask_panels(
         return (native_output,)
 
     monkeypatch.setattr(KSamplerAdvanced, "sample", sample)
-    result_latent, frames, final_image = anti_drift.EnvyKSamplerAdvancedAntiDrift().sample(
+    result_latent, frames, final_image, raw_final_image, final_mask = anti_drift.EnvyKSamplerAdvancedAntiDrift().sample(
         model=patcher, add_noise="enable", noise_seed=4, steps=2, cfg=1,
         sampler_name="euler", scheduler="normal", positive=[], negative=[],
         latent_image=latent, start_at_step=0, end_at_step=2,
@@ -1208,6 +1208,16 @@ def test_sampler_returns_eval_major_corrected_and_feathered_mask_panels(
     assert len(decoded_inputs) == 4 and len(encoded_inputs) == 3
     assert final_image.shape == (batch, height, width, 3)
     assert final_image.dtype == torch.float32 and final_image.device.type == "cpu"
+    assert raw_final_image.shape == final_image.shape
+    assert raw_final_image.dtype == torch.float32 and raw_final_image.device.type == "cpu"
+    assert final_mask.shape == (batch, height, width)
+    assert final_mask.dtype == torch.float32 and final_mask.device.type == "cpu"
+    assert torch.isfinite(final_mask).all() and torch.all((final_mask >= 0) & (final_mask <= 1))
+    stationary_reference = reference[:1].expand_as(final_image)
+    torch.testing.assert_close(
+        stationary_reference * (1 - final_mask[..., None]) + raw_final_image * final_mask[..., None],
+        final_image,
+    )
     assert frames.shape == (3 * batch * 3, height + DIAGNOSTIC_HEADER_HEIGHT, width * 2, 3)
     assert frames.device.type == "cpu" and frames.dtype == torch.float32
     assert frames.data_ptr() != decoded_inputs[0].data_ptr()
@@ -1259,6 +1269,7 @@ def test_sampler_returns_eval_major_corrected_and_feathered_mask_panels(
         torch.testing.assert_close(raw_left, predictions[final_eval][batch_index])
         torch.testing.assert_close(raw_right, predictions[final_eval][batch_index])
         torch.testing.assert_close(composite, final_image[batch_index])
+        torch.testing.assert_close(displayed_mask[..., 0], final_mask[batch_index])
         assert displayed_mask.shape == (height, width, 3)
 
     stored_frames = frames.clone()
@@ -1335,6 +1346,11 @@ def test_sampler_delegates_once_with_advanced_controls_and_clears_correction(
     assert result[2].shape == (1, 2, 2, 3)
     assert result[2].dtype == torch.float32 and result[2].device.type == "cpu"
     torch.testing.assert_close(result[2], torch.zeros_like(result[2]))
+    assert result[3].shape == result[2].shape
+    assert result[3].dtype == torch.float32 and result[3].device.type == "cpu"
+    assert result[4].shape == (1, 2, 2)
+    assert result[4].dtype == torch.float32 and result[4].device.type == "cpu"
+    torch.testing.assert_close(result[4], torch.zeros_like(result[4]))
     assert vae.decode_calls == 2 and vae.encode_calls == 1
     assert result[1].dtype == torch.float32 and result[1].device.type == "cpu"
     raw, aligned = _diagnostic_pair(result[1], 0, 0, 0, 1)
@@ -1342,8 +1358,13 @@ def test_sampler_delegates_once_with_advanced_controls_and_clears_correction(
     torch.testing.assert_close(aligned, raw)
     composite, _ = _diagnostic_pair(result[1], 0, 0, 1, 1)
     torch.testing.assert_close(composite, result[2][0])
-    assert anti_drift.EnvyKSamplerAdvancedAntiDrift.RETURN_TYPES == ("LATENT", "IMAGE", "IMAGE")
-    assert anti_drift.EnvyKSamplerAdvancedAntiDrift.RETURN_NAMES[-1] == "final_image"
+    torch.testing.assert_close(result[3], torch.zeros_like(result[3]))
+    assert anti_drift.EnvyKSamplerAdvancedAntiDrift.RETURN_TYPES == (
+        "LATENT", "IMAGE", "IMAGE", "IMAGE", "MASK"
+    )
+    assert anti_drift.EnvyKSamplerAdvancedAntiDrift.RETURN_NAMES[-2:] == (
+        "raw_final_image", "final_mask"
+    )
     assert len(calls) == 1
     base_sampler, args, kwargs = calls[0]
     patched_model = args[0]

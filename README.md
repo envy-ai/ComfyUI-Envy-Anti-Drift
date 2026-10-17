@@ -32,6 +32,8 @@ The third output, `final_image`, decodes the returned latent once, aligns it, an
 
 The composite copies the original pixels exactly wherever the feathered mask is zero. Feathered edges mix source and aligned prediction pixels. The original background is never transformed; the exposed edge fill is matched to the aligned prediction. The final image is never re-encoded, and the first output remains the native sampler result. VAE reconstruction can still alter the `LATENT` outside the mask. When the source needs resizing, exact preservation refers to its Lanczos-aligned pixels. Color matching may produce values outside 0–1.
 
+`raw_final_image` is the aligned, background-color-matched final prediction immediately before blending with the original; it may differ from the original outside the edit. `final_mask` is the exact effective feathered blend alpha as a single-channel `MASK` batch: white keeps `raw_final_image`, black keeps the original. These fourth and fifth outputs reuse the final decode and color match, with no additional VAE work.
+
 Each run adds one VAE encode and decode for the comparison reference. Each intermediate correction adds one VAE decode and encode, and finalization adds one decode. Model transfers between RAM and VRAM can dominate the cost. The final image is composited even when intermediate corrections are disabled or no selected position was sampled.
 
 The threshold measures change size, not edit intent: it can preserve large unwanted changes or erase subtle intended edits. Early predictions can differ across most of the image and therefore receive little correction.
