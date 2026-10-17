@@ -152,8 +152,7 @@ def test_blend_uses_strict_mean_rgb_threshold_and_unblurred_reference(anti_drift
     torch.testing.assert_close(kept, above_threshold, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("use_ecc,method_label", [(False, "patch fit"), (True, "ECC")])
-def test_diagnostic_headers_label_stage_alignment_and_mask_state(anti_drift, monkeypatch, use_ecc, method_label):
+def test_diagnostic_headers_label_stage_alignment_and_mask_state(anti_drift, monkeypatch):
     labels = []
     draw_image = anti_drift.ImageDraw.Draw
 
@@ -174,17 +173,17 @@ def test_diagnostic_headers_label_stage_alignment_and_mask_state(anti_drift, mon
     mask = torch.zeros((1, 2, 3, 1), dtype=torch.bool)
     frames = anti_drift.diagnostic_frames(
         image, image, mask, mask, mask,
-        [(1.0, 1.0, 0.5, -1.25)], [True], ["redetected"], "Correction 2", True, use_ecc, sigma=0.125,
+        [(1.0, 1.0, 0.5, -1.25)], [True], ["redetected"], "Correction 2", sigma=0.125,
     )
     raw, _ = _diagnostic_pair(frames, 0, 0, 0, 1)
     torch.testing.assert_close(raw, image[0], rtol=0, atol=0)
 
     assert labels == [
-        f"Correction 2 sigma=0.125 batch=0 align={method_label} sx=1.00000 sy=1.00000 dx=-1.250 dy=+0.500 recalc=yes mask=redetected",
+        "Correction 2 sigma=0.125 batch=0 align=ECC sx=1.00000 sy=1.00000 dx=-1.250 dy=+0.500 recalc=yes mask=redetected",
         "raw decode | aligned raw (black uncovered)",
-        f"Correction 2 sigma=0.125 batch=0 align={method_label} sx=1.00000 sy=1.00000 dx=-1.250 dy=+0.500 recalc=yes mask=redetected",
+        "Correction 2 sigma=0.125 batch=0 align=ECC sx=1.00000 sy=1.00000 dx=-1.250 dy=+0.500 recalc=yes mask=redetected",
         "corrected composite | displayed feathered mask",
-        f"Correction 2 sigma=0.125 batch=0 align={method_label} sx=1.00000 sy=1.00000 dx=-1.250 dy=+0.500 recalc=yes mask=redetected",
+        "Correction 2 sigma=0.125 batch=0 align=ECC sx=1.00000 sy=1.00000 dx=-1.250 dy=+0.500 recalc=yes mask=redetected",
         "registration exclusion | binary edit mask",
     ]
 
@@ -307,9 +306,8 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     assert schema["dont_unmask_pixels"][1]["default"] is False
     assert schema["comparison_blur_pixels"][1]["default"] == 2.0
     all_inputs = {**schema, **anti_drift.EnvyKSamplerAdvancedAntiDrift.INPUT_TYPES().get("optional", {})}
-    assert all_inputs["align_background"][1]["default"] is True
-    assert all_inputs["use_ecc_alignment"][1]["default"] is False
-    assert "align_background" in anti_drift.EnvyKSamplerAdvancedAntiDrift.INPUT_TYPES()["optional"]
+    assert "align_background" not in all_inputs
+    assert "use_ecc_alignment" not in all_inputs
     assert "feather" in schema["blur_pixels"][1]["tooltip"].lower()
     assert "detection only" in schema["comparison_blur_pixels"][1]["tooltip"].lower()
     defaults = anti_drift.AntiDriftCorrection(torch.zeros((1, 1, 1, 3)), object(), 6)
@@ -318,14 +316,11 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     assert defaults.mask_expand_pixels == 15
     assert defaults.dont_unmask_pixels is False
     assert defaults.comparison_blur_pixels == 2.0
-    assert defaults.align_background is True
-    assert defaults.use_ecc_alignment is False
 
 
-@pytest.mark.parametrize("method", ["patch", "ecc"])
 @pytest.mark.parametrize("sy,sx,dy,dx", [(1.018, 0.986, 2.4, -3.2), (0.982, 1.014, -2.2, 3.1)])
 @pytest.mark.parametrize("height,width", [(224, 240), (215, 281)])
-def test_alignment_recovers_independent_scales_and_signed_offsets(anti_drift, method, sy, sx, dy, dx, height, width):
+def test_alignment_recovers_independent_scales_and_signed_offsets(anti_drift, sy, sx, dy, dx, height, width):
     reference = _analytic_texture(height, width)
     # A mild color transfer keeps normalized correlation useful while testing
     # registration independently of the final background color match.
@@ -336,9 +331,9 @@ def test_alignment_recovers_independent_scales_and_signed_offsets(anti_drift, me
     conflict = _textured_image(height, width, seed=22) * 1.4
     prediction[:, 70:150, 78:162] = conflict[:, 70:150, 78:162]
 
-    transform = anti_drift.estimate_alignment(reference, prediction, exclusion, method=method)
+    transform = anti_drift.estimate_alignment(reference, prediction, exclusion)
     assert _max_corner_error(transform[0], (sy, sx, dy, dx), height, width) < 0.5, (transform[0], (sy, sx, dy, dx))
-    unmasked_transform = anti_drift.estimate_alignment(reference, unedited_prediction, exclusion, method=method)
+    unmasked_transform = anti_drift.estimate_alignment(reference, unedited_prediction, exclusion)
     assert _max_corner_error(transform[0], unmasked_transform[0], height, width) < 0.05
 
     aligned, coverage = anti_drift.warp_image(prediction, transform)
@@ -351,21 +346,14 @@ def test_alignment_recovers_independent_scales_and_signed_offsets(anti_drift, me
     assert after < before * 0.6
 
 
-@pytest.mark.parametrize("method", ["patch", "ecc"])
-def test_alignment_flat_or_fully_excluded_background_is_identity(anti_drift, method):
+def test_alignment_flat_or_fully_excluded_background_is_identity(anti_drift):
     flat = torch.full((1, 192, 208, 3), 0.4)
     exclusion = torch.ones((1, 192, 208, 1), dtype=torch.bool)
-    assert anti_drift.estimate_alignment(flat, flat.clone(), method=method) == [(1.0, 1.0, 0.0, 0.0)]
-    assert anti_drift.estimate_alignment(flat, flat.clone(), exclusion, method=method) == [(1.0, 1.0, 0.0, 0.0)]
+    assert anti_drift.estimate_alignment(flat, flat.clone()) == [(1.0, 1.0, 0.0, 0.0)]
+    assert anti_drift.estimate_alignment(flat, flat.clone(), exclusion) == [(1.0, 1.0, 0.0, 0.0)]
 
 
-def test_alignment_rejects_unknown_method_instead_of_using_another_estimator(anti_drift):
-    image = _analytic_texture(64, 72)
-    with pytest.raises(ValueError, match="Unknown background alignment method"):
-        anti_drift.estimate_alignment(image, image, method="unknown")
-
-
-def test_ecc_ignores_invalid_registration_support_and_uses_remaining_patches(anti_drift):
+def test_alignment_ignores_invalid_registration_support_and_uses_remaining_patches(anti_drift):
     height, width = 224, 280
     reference = _textured_image(height, width, seed=27)
     target_transform = (1.012, 0.989, 2.3, -3.6)
@@ -374,7 +362,7 @@ def test_ecc_ignores_invalid_registration_support_and_uses_remaining_patches(ant
     exclusion[:, 12:112, 18:125] = False
     exclusion[:, 112:212, 155:262] = False
 
-    transform = anti_drift.estimate_alignment(reference, prediction, exclusion, method="ecc")
+    transform = anti_drift.estimate_alignment(reference, prediction, exclusion)
 
     assert _max_corner_error(transform[0], target_transform, height, width) < 0.5
     aligned, coverage = anti_drift.warp_image(prediction, transform)
@@ -384,13 +372,12 @@ def test_ecc_ignores_invalid_registration_support_and_uses_remaining_patches(ant
     assert after < before * 0.3
 
 
-@pytest.mark.parametrize("method", ["patch", "ecc"])
-def test_alignment_keeps_independent_batch_transforms_and_max_corner_displacement(anti_drift, method):
+def test_alignment_keeps_independent_batch_transforms_and_max_corner_displacement(anti_drift):
     height, width = 192, 208
     reference = _analytic_texture(height, width)
     transforms = [(1.0, 1.0, 5.0, -4.0), (1.0, 1.0, -5.0, 4.0), (1.0, 1.0, 3.0, -2.0)]
     prediction = torch.cat([_analytic_raw_for_alignment(height, width, transform) for transform in transforms])
-    estimated = anti_drift.estimate_alignment(reference, prediction, method=method)
+    estimated = anti_drift.estimate_alignment(reference, prediction)
     assert len(estimated) == 3
     for got, wanted in zip(estimated, transforms):
         assert _max_corner_error(got, wanted, height, width) < 0.5, (got, wanted)
@@ -431,15 +418,14 @@ def test_alignment_inverse_mask_roundtrip_and_integer_warp_preserve_dtype(anti_d
     assert torch.equal(restored[:, 3:-3, 4:-4], binary[:, 3:-3, 4:-4])
 
 
-@pytest.mark.parametrize("method", ["patch", "ecc"])
-def test_subpixel_alignment_recalculates_masks_at_one_third_pixel_per_batch(anti_drift, method):
+def test_subpixel_alignment_recalculates_masks_at_one_third_pixel_per_batch(anti_drift):
     height, width = 192, 208
     reference = _analytic_texture(height, width)
     prediction = torch.cat((
         _analytic_raw_for_alignment(height, width, (1.0, 1.0, 0.0, 0.2)),
         _analytic_raw_for_alignment(height, width, (1.0, 1.0, 0.0, 0.4)),
     ))
-    transforms = anti_drift.estimate_alignment(reference, prediction, method=method)
+    transforms = anti_drift.estimate_alignment(reference, prediction)
     assert _max_corner_error(transforms[0], (1.0, 1.0, 0.0, 0.2), height, width) < 0.5, transforms
     assert _max_corner_error(transforms[1], (1.0, 1.0, 0.0, 0.4), height, width) < 0.5, transforms
     assert [value > 1 / 3 for value in anti_drift.alignment_displacement(transforms, height, width)] == [False, True], transforms
@@ -506,7 +492,7 @@ def test_final_alignment_moves_restored_background_and_edit_once(anti_drift):
 
     final = anti_drift.finalize_image(
         reference, prediction, mask, 0, 100, 0, comparison_blur_pixels=0,
-        align_background=True, dont_unmask_pixels=True,
+        dont_unmask_pixels=True,
     )
 
     torch.testing.assert_close(final[0, 26, 25], source_feature, rtol=0, atol=1e-5)
@@ -549,7 +535,7 @@ def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
 
     correction = anti_drift.AntiDriftCorrection(
         reference, VAE(), 0, 10, 0, dont_unmask_pixels=True,
-        comparison_blur_pixels=4, align_background=True,
+        comparison_blur_pixels=4,
     )
     _enable_corrections(correction, 2)
     correction.models = [object()]
@@ -578,22 +564,6 @@ def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
     for image, displaced_center in ((encoded[0], (99, 81)), (encoded[1], (82, 97))):
         assert image[0, 90, 90].mean() > 0.8
         assert image[0, displaced_center[0], displaced_center[1]].mean() < 0.8
-
-
-def test_disabled_alignment_keeps_the_legacy_final_composite(anti_drift, monkeypatch):
-    prediction = torch.full((1, 3, 4, 3), 0.7)
-    reference = torch.zeros_like(prediction)
-    mask = torch.ones((1, 3, 4, 1), dtype=torch.bool)
-
-    def unexpected_alignment(*args, **kwargs):
-        raise AssertionError("disabled alignment must not register the prediction")
-
-    monkeypatch.setattr(anti_drift, "alignment_transforms", unexpected_alignment)
-    final = anti_drift.finalize_image(
-        reference, prediction, mask, 0, 5, 0, align_background=False
-    )
-
-    torch.testing.assert_close(final, prediction)
 
 
 def test_correction_normalizes_latents_caches_reference_and_restores_each_prediction(
@@ -1166,6 +1136,22 @@ def test_sampler_delegates_once_with_advanced_controls_and_clears_correction(
     schema = sampler.INPUT_TYPES()["required"]
     assert "frequency" not in str(schema).lower()
     assert "mask_start_step" not in schema and "mask_end_step" not in schema
+
+
+def test_removed_alignment_booleans_are_ignored_during_prompt_input_resolution(anti_drift):
+    import execution
+
+    inputs = {
+        "align_background": False,
+        "use_ecc_alignment": True,
+        "blur_pixels": 3.0,
+    }
+    resolved, missing, _ = execution.get_input_data(
+        inputs, anti_drift.EnvyKSamplerAdvancedAntiDrift, "anti-drift-test"
+    )
+
+    assert resolved == {"blur_pixels": [3.0]}
+    assert missing == {}
 
 
 def test_sampler_clears_correction_when_native_sampling_raises(anti_drift, monkeypatch):

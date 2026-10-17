@@ -35,135 +35,6 @@ def match_background_color(prediction, reference, mask):
     return matched
 
 
-def _correlation(reference, prediction, unmasked, radius):
-    height, width = reference.shape
-    size = (height * 2, width * 2)
-    source = unmasked * reference
-    target = unmasked * prediction
-    source_fft = torch.fft.rfft2(source, s=size)
-    mask_fft = torch.fft.rfft2(unmasked, s=size)
-    target_fft = torch.fft.rfft2(target, s=size)
-    valid_fft = mask_fft
-
-    def correlate(left, right):
-        return torch.fft.irfft2(left.conj() * right, s=size)
-
-    offsets = torch.arange(-radius, radius + 1, device=reference.device)
-    rows = offsets.remainder(size[0])[:, None]
-    columns = offsets.remainder(size[1])[None, :]
-
-    def window(values):
-        return values[rows, columns]
-
-    count = window(correlate(mask_fft, valid_fft)).clamp_min(0)
-    source_sum = window(correlate(source_fft, valid_fft))
-    source_square = window(correlate(torch.fft.rfft2(source * reference, s=size), valid_fft))
-    target_sum = window(correlate(mask_fft, target_fft))
-    target_square = window(correlate(mask_fft, torch.fft.rfft2(target * prediction, s=size)))
-    cross = window(correlate(source_fft, target_fft))
-    count_safe = count.clamp_min(1)
-    numerator = cross - source_sum * target_sum / count_safe
-    source_variance = (source_square - source_sum.square() / count_safe).clamp_min(0)
-    target_variance = (target_square - target_sum.square() / count_safe).clamp_min(0)
-    score = numerator / (source_variance * target_variance).sqrt().clamp_min(1e-8)
-    eligible = unmasked.sum()
-    score = score.masked_fill((count < eligible * 0.6) | (count < 64) | (source_variance < count * 1e-5) | (target_variance < count * 1e-5), -2)
-    return score
-
-
-def _refine_patch(reference, prediction, unmasked, dy, dx):
-    source = reference.cpu().numpy()
-    target = prediction.cpu().numpy()
-    available = unmasked.cpu().numpy().astype(bool)
-    available_float = available.astype(np.float32)
-    yy, xx = np.indices(source.shape, dtype=np.float64)
-
-    def valid_pixels(offset):
-        sample_y = yy + offset[0]
-        sample_x = xx + offset[1]
-        valid = available & (sample_y >= 0) & (sample_y <= source.shape[0] - 1) & (sample_x >= 0) & (sample_x <= source.shape[1] - 1)
-        valid &= ndimage.map_coordinates(available_float, (sample_y, sample_x), order=1, mode="constant", cval=0) > 0.999
-        return valid, sample_y, sample_x
-
-    def score(offset):
-        valid, sample_y, sample_x = valid_pixels(offset)
-        if valid.sum() < 64:
-            return 1.0
-        sampled = ndimage.map_coordinates(target, (sample_y, sample_x), order=1, mode="constant", cval=0)
-        a = source[valid] - source[valid].mean()
-        b = sampled[valid] - sampled[valid].mean()
-        denominator = np.linalg.norm(a) * np.linalg.norm(b)
-        return -float(np.dot(a, b) / denominator) if denominator > 1e-8 else 1.0
-
-    result = optimize.minimize(score, (dy, dx), method="Powell",
-                               bounds=((dy - 0.75, dy + 0.75), (dx - 0.75, dx + 0.75)),
-                               options={"maxfev": 80, "xtol": 1e-3, "ftol": 1e-4})
-    valid, _, _ = valid_pixels(result.x)
-    if valid.sum() < 64:
-        return None
-    center_y, center_x = np.where(valid)
-    return result.x[0], result.x[1], center_y.mean(), center_x.mean()
-
-
-def _patch_alignment(reference, prediction, unmasked):
-    height, width = reference.shape
-    patch_height = min(192, height // 4)
-    patch_width = min(192, width // 4)
-    radius = min(32, patch_height // 4, patch_width // 4)
-    if radius < 1:
-        return (1.0, 1.0, 0.0, 0.0)
-    patches = []
-    for row in range(5):
-        top = (height - patch_height) * row // 4
-        for column in range(5):
-            left = (width - patch_width) * column // 4
-            region = (slice(top, top + patch_height), slice(left, left + patch_width))
-            tile_mask = unmasked[region].float()
-            if tile_mask.sum() < max(64, patch_height * patch_width * 0.3):
-                continue
-            scores = _correlation(reference[region], prediction[region], tile_mask, radius)
-            best = torch.argmax(scores).item()
-            y, x = divmod(best, scores.shape[1])
-            peak = scores[y, x].item()
-            if peak < 0.4 or y in (0, 2 * radius) or x in (0, 2 * radius):
-                continue
-            other = scores.clone()
-            other[max(0, y - 2):y + 3, max(0, x - 2):x + 3] = -2
-            if peak - other.max().item() < 0.002:
-                continue
-            refined = _refine_patch(reference[region], prediction[region], tile_mask, y - radius, x - radius)
-            if refined is None:
-                continue
-            dy, dx, center_y, center_x = refined
-            patches.append((top + center_y, left + center_x, dy, dx))
-    if len(patches) < 4:
-        return (1.0, 1.0, 0.0, 0.0)
-    patches = np.asarray(patches)
-    keep = np.ones(len(patches), dtype=bool)
-    for _ in range(3):
-        if keep.sum() < 4 or np.ptp(patches[keep, 0]) < height * 0.35 or np.ptp(patches[keep, 1]) < width * 0.35:
-            return (1.0, 1.0, 0.0, 0.0)
-        y_fit = optimize.least_squares(lambda line: np.polyval(line, patches[keep, 0]) - patches[keep, 2],
-                                       np.polyfit(patches[keep, 0], patches[keep, 2], 1), loss="soft_l1", f_scale=1).x
-        x_fit = optimize.least_squares(lambda line: np.polyval(line, patches[keep, 1]) - patches[keep, 3],
-                                       np.polyfit(patches[keep, 1], patches[keep, 3], 1), loss="soft_l1", f_scale=1).x
-        residual = np.hypot(patches[:, 2] - np.polyval(y_fit, patches[:, 0]), patches[:, 3] - np.polyval(x_fit, patches[:, 1]))
-        next_keep = residual < max(1.0, np.median(residual[keep]) * 2.5)
-        if np.array_equal(keep, next_keep):
-            break
-        keep = next_keep
-    if keep.sum() < 4 or np.ptp(patches[keep, 0]) < height * 0.35 or np.ptp(patches[keep, 1]) < width * 0.35:
-        return (1.0, 1.0, 0.0, 0.0)
-    y_fit = np.polyfit(patches[keep, 0], patches[keep, 2], 1)
-    x_fit = np.polyfit(patches[keep, 1], patches[keep, 3], 1)
-    residual = np.hypot(patches[:, 2] - np.polyval(y_fit, patches[:, 0]), patches[:, 3] - np.polyval(x_fit, patches[:, 1]))
-    sy, dy = 1 + y_fit[0], y_fit[1]
-    sx, dx = 1 + x_fit[0], x_fit[1]
-    if not 0.9 < sy < 1.1 or not 0.9 < sx < 1.1 or np.median(residual[keep]) > 1.5:
-        return (1.0, 1.0, 0.0, 0.0)
-    return (float(sy), float(sx), float(dy), float(dx))
-
-
 def _ecc_alignment(reference, prediction, unmasked):
     height, width = reference.shape
     identity = (1.0, 1.0, 0.0, 0.0)
@@ -234,17 +105,14 @@ def _ecc_alignment(reference, prediction, unmasked):
     return tuple(float(value) for value in transform)
 
 
-def estimate_alignment(reference, prediction, exclusion_mask=None, method="patch"):
-    if method not in ("patch", "ecc"):
-        raise ValueError(f"Unknown background alignment method: {method}")
+def estimate_alignment(reference, prediction, exclusion_mask=None):
     batch, height, width, _ = prediction.shape
     source_luma = reference[0].float().mean(dim=-1)
     transforms = []
     for index in range(batch):
         available = torch.ones((height, width), dtype=torch.bool, device=prediction.device) if exclusion_mask is None else ~exclusion_mask[index, ..., 0]
         target_luma = prediction[index].float().mean(dim=-1)
-        estimator = _patch_alignment if method == "patch" else _ecc_alignment
-        transforms.append(estimator(source_luma, target_luma, available))
+        transforms.append(_ecc_alignment(source_luma, target_luma, available))
     return transforms
 
 
