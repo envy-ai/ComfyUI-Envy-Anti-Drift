@@ -16,6 +16,8 @@ import comfy.utils
 import latent_preview
 from nodes import KSamplerAdvanced
 
+from .registration import match_background_color, register_prediction
+
 
 def blur_image(image, blur_pixels):
     if blur_pixels == 0:
@@ -48,13 +50,16 @@ def feather_mask(binary_mask, blur_pixels, mask_expand_pixels, dtype):
     return blur_image(mask, blur_pixels)
 
 
-def blend_prediction(reference, blurred_reference, prediction, blur_pixels, threshold_percent, mask_expand_pixels=15, retained_mask=None, comparison_blur_pixels=2.0):
+def blend_prediction(reference, blurred_reference, prediction, blur_pixels, threshold_percent, mask_expand_pixels=15, retained_mask=None, comparison_blur_pixels=2.0, valid=None):
     difference = (blur_image(prediction, comparison_blur_pixels) - blurred_reference).abs().mean(dim=-1, keepdim=True)
     binary_mask = difference > threshold_percent / 100
+    if valid is not None:
+        binary_mask &= valid
     if retained_mask is not None:
         binary_mask |= retained_mask
     mask = feather_mask(binary_mask, blur_pixels, mask_expand_pixels, prediction.dtype)
-    matched = match_background_color(prediction, reference, mask)
+    matching_mask = mask if valid is None else torch.where(valid, mask, torch.ones_like(mask))
+    matched = match_background_color(prediction, reference, matching_mask)
     corrected = torch.where(mask == 0, reference, torch.lerp(reference, matched, mask))
     return corrected, mask, binary_mask
 
@@ -84,52 +89,43 @@ def parse_correction_steps(value, steps):
     return result
 
 
-def match_background_color(prediction, reference, mask):
-    matched = prediction.clone()
-    for index in range(prediction.shape[0]):
-        unmasked = mask[index, ..., 0] == 0
-        if not unmasked.any():
-            continue
-        generated_pixels = prediction[index][unmasked]
-        source_pixels = reference[0][unmasked]
-        if generated_pixels.dtype in (torch.float16, torch.bfloat16):
-            generated_pixels = generated_pixels.float()
-            source_pixels = source_pixels.float()
-        quantiles = generated_pixels.new_tensor([0.1, 0.5, 0.9])
-        generated = torch.quantile(generated_pixels, quantiles, dim=0)
-        source = torch.quantile(source_pixels, quantiles, dim=0)
-        generated_spread = generated[2] - generated[0]
-        source_spread = source[2] - source[0]
-        valid = (generated_spread != 0) & (source_spread != 0)
-        gain = torch.ones_like(generated_spread)
-        offset = torch.zeros_like(generated_spread)
-        gain[valid] = source_spread[valid] / generated_spread[valid]
-        offset[valid] = source[1, valid] - gain[valid] * generated[1, valid]
-        matched[index].mul_(gain).add_(offset)
-    return matched
+def align_prediction(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, previous_mask=None):
+    provisional = (blur_image(prediction, comparison_blur_pixels) - blurred_reference).abs().mean(dim=-1, keepdim=True) > threshold_percent / 100
+    if previous_mask is not None:
+        provisional |= previous_mask
+    return register_prediction(reference, prediction, provisional)
 
 
-def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0):
+def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, align_background=True):
     if prediction.ndim != 4 or prediction.shape[-1] < 3:
         raise ValueError("Anti-Drift requires an image VAE that decodes to [batch, height, width, RGB].")
     prediction = prediction[..., :3].detach().to(device="cpu", dtype=torch.float32, copy=True)
     reference = prepare_reference(image1, prediction)
-    if binary_mask is None:
-        difference = (blur_image(prediction, comparison_blur_pixels) - blur_image(reference, comparison_blur_pixels)).abs().mean(dim=-1, keepdim=True)
-        binary_mask = difference > threshold_percent / 100
-    else:
+    blurred_reference = blur_image(reference, comparison_blur_pixels) if align_background or binary_mask is None else None
+    if binary_mask is not None:
         binary_mask = binary_mask.detach().to(device="cpu")
+    valid = None
+    if align_background:
+        previous_mask = None if binary_mask is None else feather_mask(binary_mask, blur_pixels, mask_expand_pixels, prediction.dtype) > 0
+        prediction, valid = align_prediction(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, previous_mask)
+    if binary_mask is None:
+        difference = (blur_image(prediction, comparison_blur_pixels) - blurred_reference).abs().mean(dim=-1, keepdim=True)
+        binary_mask = difference > threshold_percent / 100
+        if valid is not None:
+            binary_mask &= valid
     mask = feather_mask(binary_mask, blur_pixels, mask_expand_pixels, prediction.dtype)
-    matched = match_background_color(prediction, reference, mask)
+    matching_mask = mask if valid is None else torch.where(valid, mask, torch.ones_like(mask))
+    matched = match_background_color(prediction, reference, matching_mask)
     return torch.where(mask == 0, reference, torch.lerp(reference, matched, mask))
 
 
 class AntiDriftCorrection:
-    def __init__(self, image1, vae, blur_pixels, threshold_percent=5.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, start_at_step=0, steps=20, comparison_blur_pixels=2.0):
+    def __init__(self, image1, vae, blur_pixels, threshold_percent=5.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, start_at_step=0, steps=20, comparison_blur_pixels=2.0, align_background=True):
         self.image1 = image1
         self.vae = vae
         self.blur_pixels = blur_pixels
         self.comparison_blur_pixels = comparison_blur_pixels
+        self.align_background = align_background
         self.threshold_percent = threshold_percent
         self.mask_expand_pixels = mask_expand_pixels
         self.correction_steps = parse_correction_steps(correction_steps, steps)
@@ -192,8 +188,12 @@ class AntiDriftCorrection:
                 self.reference = prepare_reference(self.image1, prediction)
                 self.blurred_reference = blur_image(self.reference, self.comparison_blur_pixels)
                 self.image1 = None
+            valid = None
+            if self.align_background:
+                previous_mask = None if self.last_binary_mask is None else feather_mask(self.last_binary_mask, self.blur_pixels, self.mask_expand_pixels, prediction.dtype) > 0
+                prediction, valid = align_prediction(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, previous_mask)
             retained_mask = self.retained_mask if self.dont_unmask_pixels else None
-            corrected, mask, binary_mask = blend_prediction(self.reference, self.blurred_reference, prediction, self.blur_pixels, self.threshold_percent, self.mask_expand_pixels, retained_mask, self.comparison_blur_pixels)
+            corrected, mask, binary_mask = blend_prediction(self.reference, self.blurred_reference, prediction, self.blur_pixels, self.threshold_percent, self.mask_expand_pixels, retained_mask, self.comparison_blur_pixels, valid)
             if self.dont_unmask_pixels:
                 self.retained_mask = binary_mask
             self.last_binary_mask = binary_mask
@@ -240,12 +240,13 @@ class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
             "dont_unmask_pixels": ("BOOLEAN", {"default": False, "display_name": "don't unmask pixels", "tooltip": "Keep every binary edit-mask location detected at selected correction steps. Retains mask locations only; predicted pixels continue changing."}),
             "comparison_blur_pixels": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10000.0, "step": 1.0, "tooltip": "Gaussian standard deviation in pixels for RGB difference detection only. Zero compares unblurred images; mask feathering uses blur_pixels."}),
         })
+        inputs.setdefault("optional", {})["align_background"] = ("BOOLEAN", {"default": True, "tooltip": "Correct confident whole-pixel shifts using unmasked background before edit detection. Searches less than 32 pixels per axis; fills exposed edges with a two-pixel feather."})
         return inputs
 
     DESCRIPTION = "Corrects selected clean denoised predictions against image1 during one uninterrupted native KSampler Advanced run."
 
-    def sample(self, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, image1, vae, blur_pixels=6.0, threshold_percent=5.0, denoise=1.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, comparison_blur_pixels=2.0):
-        correction = AntiDriftCorrection(image1, vae, blur_pixels, threshold_percent, mask_expand_pixels, correction_steps, dont_unmask_pixels, start_at_step, steps, comparison_blur_pixels)
+    def sample(self, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, image1, vae, blur_pixels=6.0, threshold_percent=5.0, denoise=1.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, comparison_blur_pixels=2.0, align_background=True):
+        correction = AntiDriftCorrection(image1, vae, blur_pixels, threshold_percent, mask_expand_pixels, correction_steps, dont_unmask_pixels, start_at_step, steps, comparison_blur_pixels, align_background)
         try:
             patched_model = model.clone()
             patched_model.set_model_sampler_post_cfg_function(correction)
@@ -253,7 +254,7 @@ class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
             result = super().sample(patched_model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, denoise=denoise)
             with comfy.model_prefetch.pause_malloc_graph():
                 prediction = vae.decode(result[0]["samples"])
-                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels)
+                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels, align_background)
             preview = latent_preview.preview_to_image(final_image[0], do_scale=False)
             comfy.utils.ProgressBar(steps).update_absolute(steps, steps, ("JPEG", preview, None))
             intermediate_steps_and_masks = torch.cat(correction.intermediate_frames, dim=0) if correction.intermediate_frames else torch.empty((0, 0, 0, 3), device="cpu", dtype=torch.float32)

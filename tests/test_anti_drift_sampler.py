@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 import types
 from contextlib import nullcontext
 from pathlib import Path
@@ -20,18 +21,43 @@ def _enable_corrections(correction, count=1):
     return correction
 
 
+def _textured_image(height, width, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    coarse = torch.rand((1, 3, 16, 16), generator=generator)
+    smooth = torch.nn.functional.interpolate(
+        coarse, size=(height, width), mode="bilinear", align_corners=False
+    )
+    detail = torch.rand((1, 3, height, width), generator=generator) * 0.04
+    image = smooth * 0.8 + detail
+    return image.permute(0, 2, 3, 1).contiguous()
+
+
+def _translate(image, dy, dx):
+    height, width = image.shape[1:3]
+    translated = torch.zeros_like(image)
+    source_y = slice(max(0, -dy), min(height, height - dy))
+    source_x = slice(max(0, -dx), min(width, width - dx))
+    target_y = slice(max(0, dy), min(height, height + dy))
+    target_x = slice(max(0, dx), min(width, width + dx))
+    translated[:, target_y, target_x] = image[:, source_y, source_x]
+    return translated
+
+
 @pytest.fixture(scope="module")
 def anti_drift():
     import comfy.cli_args
 
     comfy.cli_args.args.cpu = True
+    package_name = "envy_anti_drift_test_package"
     spec = importlib.util.spec_from_file_location(
-        "envy_anti_drift",
-        PACK_ROOT / "anti_drift.py",
+        package_name,
+        PACK_ROOT / "__init__.py",
+        submodule_search_locations=[str(PACK_ROOT)],
     )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[package_name] = package
+    spec.loader.exec_module(package)
+    return importlib.import_module(f"{package_name}.anti_drift")
 
 
 def test_blend_uses_strict_mean_rgb_threshold_and_unblurred_reference(anti_drift):
@@ -189,6 +215,9 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     assert schema["threshold_percent"][1]["default"] == 5.0
     assert schema["dont_unmask_pixels"][1]["default"] is False
     assert schema["comparison_blur_pixels"][1]["default"] == 2.0
+    all_inputs = {**schema, **anti_drift.EnvyKSamplerAdvancedAntiDrift.INPUT_TYPES().get("optional", {})}
+    assert all_inputs["align_background"][1]["default"] is True
+    assert "align_background" in anti_drift.EnvyKSamplerAdvancedAntiDrift.INPUT_TYPES()["optional"]
     assert "feather" in schema["blur_pixels"][1]["tooltip"].lower()
     assert "detection only" in schema["comparison_blur_pixels"][1]["tooltip"].lower()
     defaults = anti_drift.AntiDriftCorrection(torch.zeros((1, 1, 1, 3)), object(), 6)
@@ -197,6 +226,176 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     assert defaults.mask_expand_pixels == 15
     assert defaults.dont_unmask_pixels is False
     assert defaults.comparison_blur_pixels == 2.0
+    assert defaults.align_background is True
+
+
+@pytest.mark.parametrize("dy,dx", [(5, -4), (-5, 4)])
+def test_registration_recovers_signed_translation_from_unmasked_background(
+    anti_drift, dy, dx
+):
+    height = width = 192
+    reference = _textured_image(height, width, seed=9)
+    edited = reference.clone()
+    conflict = _textured_image(height, width, seed=22) * 2
+    edited[:, 48:144, 48:144] = conflict[:, 48:144, 48:144]
+    prediction = _translate(edited, dy, dx)
+    edit_mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    edit_mask[:, 48:144, 48:144] = True
+
+    aligned, valid = anti_drift.register_prediction(reference, prediction, edit_mask)
+
+    assert valid.shape == (1, height, width, 1)
+    assert not valid.all()
+    background = valid & ~edit_mask
+    assert background.sum() > 1000
+    torch.testing.assert_close(
+        aligned[background.expand_as(aligned)],
+        reference[background.expand_as(reference)],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_alignment_bootstraps_a_first_pass_without_an_existing_mask(anti_drift):
+    height = width = 192
+    reference = _textured_image(height, width, seed=15)
+    edited = reference.clone()
+    edit_mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    edit_mask[:, 48:144, 48:144] = True
+    edited[:, 48:144, 48:144] = 0.95
+    prediction = _translate(edited, 2, -2)
+
+    aligned, valid = anti_drift.align_prediction(
+        reference, prediction, anti_drift.blur_image(reference, 2), 5, 2
+    )
+
+    assert not valid.all()
+    background = valid & ~edit_mask
+    assert background.sum() > 1000
+    torch.testing.assert_close(
+        aligned[background.expand_as(aligned)],
+        reference[background.expand_as(reference)],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_registration_leaves_no_shift_flat_and_ambiguous_images_unchanged(anti_drift):
+    textured = _textured_image(192, 192, seed=31)
+    flat = torch.full_like(textured, 0.4)
+    stripes = (torch.arange(192) % 8).float().div(8).reshape(1, 1, 192, 1)
+    ambiguous = stripes.expand(1, 192, 192, 3).clone()
+
+    for image in (textured, flat, ambiguous):
+        aligned, valid = anti_drift.register_prediction(image, image.clone())
+        torch.testing.assert_close(aligned, image, rtol=0, atol=0)
+        assert valid.all()
+
+    # Periodic stripes have equally good nonzero translations, so they cannot
+    # identify a unique shift.
+    periodic_reference = torch.roll(ambiguous, shifts=4, dims=2)
+    aligned, valid = anti_drift.register_prediction(periodic_reference, ambiguous)
+    torch.testing.assert_close(aligned, ambiguous, rtol=0, atol=0)
+    assert valid.all()
+
+
+def test_registration_does_not_use_content_inside_the_edit_mask(anti_drift):
+    height = width = 192
+    reference = _textured_image(height, width, seed=41)
+    mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    mask[:, 40:152, 40:152] = True
+    prediction = _textured_image(height, width, seed=74)
+    shifted_reference = _translate(reference, 6, -5)
+    prediction[:, 48:144, 48:144] = shifted_reference[:, 48:144, 48:144]
+
+    aligned, valid = anti_drift.register_prediction(reference, prediction, mask)
+
+    torch.testing.assert_close(aligned, prediction, rtol=0, atol=0)
+    assert valid.all()
+
+
+def test_registration_is_batch_local_and_edge_fill_uses_valid_histogram_support(
+    anti_drift
+):
+    height = width = 192
+    reference = _textured_image(height, width, seed=83)
+    transform = torch.tensor([1.25, 1.1, 1.35]).reshape(1, 1, 1, 3)
+    offset = torch.tensor([0.06, 0.08, 0.04]).reshape(1, 1, 1, 3)
+    colored = reference * transform + offset
+    prediction = torch.cat((_translate(colored, 5, -4), _translate(colored, -5, 4)))
+
+    aligned, valid = anti_drift.register_prediction(reference, prediction)
+
+    assert valid.shape == (2, height, width, 1)
+    assert not valid.all()
+    for batch_index in range(2):
+        overlap = valid[batch_index].expand_as(reference[0])
+        torch.testing.assert_close(
+            aligned[batch_index][overlap], colored[0][overlap], rtol=0, atol=0
+        )
+    # The introduced zero border cannot affect the source-to-generated fit.
+    torch.testing.assert_close(
+        aligned[0, 80, -1], colored[0, 80, -1], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        aligned[1, 80, 0], colored[0, 80, 0], rtol=0, atol=0
+    )
+
+
+def test_registration_feathers_exposed_edge_and_fills_holes_from_source(
+    anti_drift, monkeypatch
+):
+    registration = importlib.import_module(f"{anti_drift.__package__}.registration")
+    monkeypatch.setattr(registration, "_translation", lambda *args: (0, 3))
+    height, width = 20, 24
+    reference = torch.zeros((1, height, width, 3))
+    reference[:] = torch.tensor([0.2, 0.3, 0.4])
+    generated = torch.empty_like(reference)
+    generated[:] = torch.tensor([0.7, 0.8, 0.9])
+    prediction = _translate(generated, 0, 3)
+
+    aligned, valid = anti_drift.register_prediction(reference, prediction)
+
+    torch.testing.assert_close(aligned[0, 8, width - 4], torch.tensor([0.36666667, 0.46666667, 0.56666667]))
+    torch.testing.assert_close(aligned[0, 8, width - 5], torch.tensor([0.53333336, 0.6333333, 0.73333335]))
+    torch.testing.assert_close(aligned[0, 8, width - 2], reference[0, 8, width - 2], rtol=0, atol=0)
+    assert not valid[0, 8, width - 4, 0]
+    assert not valid[0, 8, width - 5, 0]
+    assert not valid[0, 8, width - 3:, 0].any()
+
+
+def test_final_alignment_keeps_source_exact_outside_edit_mask(anti_drift):
+    height = width = 192
+    reference = _textured_image(height, width, seed=95)
+    edited = reference.clone()
+    mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    mask[:, 60:132, 60:132] = True
+    edited[:, 90:105, 90:105] = 0.95
+    prediction = _translate(edited, 4, 5)
+
+    final = anti_drift.finalize_image(
+        reference, prediction, mask, 0, 100, 0, comparison_blur_pixels=0,
+        align_background=True,
+    )
+
+    assert torch.equal(final[~mask[..., 0]], reference[~mask[..., 0]])
+    assert final[0, 92, 92].mean() > 0.8
+
+
+def test_disabled_alignment_keeps_the_legacy_final_composite(anti_drift, monkeypatch):
+    prediction = torch.full((1, 3, 4, 3), 0.7)
+    reference = torch.zeros_like(prediction)
+    mask = torch.ones((1, 3, 4, 1), dtype=torch.bool)
+
+    def unexpected_alignment(*args, **kwargs):
+        raise AssertionError("disabled alignment must not register the prediction")
+
+    monkeypatch.setattr(anti_drift, "align_prediction", unexpected_alignment)
+    final = anti_drift.finalize_image(
+        reference, prediction, mask, 0, 5, 0, align_background=False
+    )
+
+    torch.testing.assert_close(final, prediction)
 
 
 def test_correction_normalizes_latents_caches_reference_and_restores_each_prediction(
