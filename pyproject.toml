@@ -1,0 +1,16 @@
+[project]
+name = "envy-anti-drift"
+version = "1.0.0"
+description = "Sparse image-editing corrections, mask history, and final source-preserving compositing for ComfyUI."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/envy-ai/ComfyUI-Envy-Anti-Drift"
+
+[tool.comfy]
+PublisherId = "envy-ai"
+DisplayName = "Envy Anti-Drift"
+requires-comfyui = ">=0.40.0"
