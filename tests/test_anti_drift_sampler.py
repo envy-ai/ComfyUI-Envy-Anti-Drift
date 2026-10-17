@@ -644,6 +644,137 @@ def test_reconstructed_comparison_baseline_cancels_shared_vae_artifact(
     assert (without_baseline[0, outside_edit] - source[0, outside_edit]).abs().mean() > 0.01
 
 
+def test_small_mask_components_use_eight_connectivity_per_batch(anti_drift):
+    binary = torch.zeros((2, 8, 9, 1), dtype=torch.bool)
+    binary[0, 1, 1, 0] = True
+    binary[0, 3, 3, 0] = True
+    binary[0, 4, 4, 0] = True
+    binary[1, 1, 1, 0] = True
+
+    unchanged = anti_drift.remove_small_mask_components(binary, 1)
+    cleaned = anti_drift.remove_small_mask_components(binary, 2)
+
+    assert torch.equal(unchanged, binary)
+    assert not cleaned[0, 1, 1, 0] and not cleaned[1, 1, 1, 0]
+    assert cleaned[0, 3, 3, 0] and cleaned[0, 4, 4, 0]
+    assert cleaned[0].sum() == 2 and cleaned[1].sum() == 0
+
+
+def test_final_mask_cleanup_precedes_expansion_and_updates_diagnostics(
+    anti_drift, monkeypatch
+):
+    reference = torch.zeros((1, 16, 18, 3))
+    prediction = reference.clone()
+    binary = torch.zeros((1, 16, 18, 1), dtype=torch.bool)
+    binary[0, 2, 2, 0] = True
+    binary[0, 6, 6, 0] = True
+    binary[0, 7, 7, 0] = True
+    transforms = [(1.0, 1.0, 0.0, 0.0)]
+    monkeypatch.setattr(anti_drift, "alignment_transforms", lambda *args: (args[6].append(torch.zeros_like(binary)) or transforms))
+    original_feather = anti_drift.feather_mask
+    feather_inputs = []
+
+    def capture_feather(mask, *args):
+        feather_inputs.append(mask.clone())
+        return original_feather(mask, *args)
+
+    monkeypatch.setattr(anti_drift, "feather_mask", capture_feather)
+    diagnostics = []
+    anti_drift.finalize_image(
+        reference, prediction, binary, 0, 10, 3,
+        diagnostic_output=diagnostics, min_mask_area=2,
+    )
+
+    cleaned = torch.zeros_like(binary)
+    cleaned[0, 6, 6, 0] = True
+    cleaned[0, 7, 7, 0] = True
+    assert torch.equal(feather_inputs[0], cleaned)
+    _, diagnostic_binary = _diagnostic_pair(diagnostics[0], 0, 0, 2, batch_size=1)
+    torch.testing.assert_close(diagnostic_binary[..., 0], cleaned[0, ..., 0].float())
+
+
+def test_correction_cleans_retained_binary_mask_before_feathering(
+    anti_drift, monkeypatch
+):
+    import comfy.model_management
+    import comfy.model_prefetch
+
+    monkeypatch.setattr(comfy.model_prefetch, "pause_malloc_graph", nullcontext)
+    monkeypatch.setattr(comfy.model_management, "load_models_gpu", lambda *args, **kwargs: None)
+    height = width = 20
+    reference = torch.zeros((1, height, width, 3))
+    prediction = reference.clone()
+    first_binary = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    first_binary[0, 2, 2, 0] = True
+    first_binary[0, 5, 5, 0] = True
+    first_binary[0, 6, 6, 0] = True
+    next_binary = torch.zeros_like(first_binary)
+    next_binary[0, 12, 12, 0] = True
+    detected_masks = iter((first_binary, next_binary))
+
+    class VAE:
+        def __init__(self):
+            self.decode_calls = 0
+
+        def decode(self, samples):
+            self.decode_calls += 1
+            return prediction
+
+        def encode(self, image):
+            return torch.zeros((1, 4, height, width))
+
+    class Model:
+        def process_latent_out(self, samples):
+            return samples
+
+        def process_latent_in(self, samples):
+            return samples
+
+    def identity_alignment(*args):
+        args[6].append(torch.zeros_like(first_binary))
+        return [(1.0, 1.0, 0.0, 0.0)]
+
+    monkeypatch.setattr(anti_drift, "alignment_transforms", identity_alignment)
+    monkeypatch.setattr(
+        anti_drift, "output_binary_mask",
+        lambda *args: (next(detected_masks).clone(), [False]),
+    )
+    original_feather = anti_drift.feather_mask
+    feather_inputs = []
+
+    def capture_feather(mask, *args):
+        feather_inputs.append(mask.clone())
+        return original_feather(mask, *args)
+
+    monkeypatch.setattr(anti_drift, "feather_mask", capture_feather)
+    correction = anti_drift.AntiDriftCorrection(
+        reference, VAE(), 0, 10, 2, dont_unmask_pixels=True,
+        comparison_blur_pixels=0,
+    )
+    _enable_corrections(correction, 2)
+    correction.models = [object()]
+    correction.memory_required = 0
+    correction.minimum_memory_required = 0
+    args = {
+        "denoised": torch.zeros((1, 4, height, width)),
+        "model": Model(), "sigma": torch.tensor([1.0]),
+    }
+    correction(args)
+    first_cleaned = correction.last_binary_mask.clone()
+    correction(args)
+
+    assert not first_cleaned[0, 2, 2, 0]
+    assert first_cleaned[0, 5, 5, 0] and first_cleaned[0, 6, 6, 0]
+    assert torch.equal(correction.retained_mask, correction.last_binary_mask)
+    assert not correction.last_binary_mask[0, 12, 12, 0]
+    assert torch.equal(feather_inputs[0], first_cleaned)
+    assert torch.equal(feather_inputs[1], first_cleaned)
+    _, diagnostic_binary = _diagnostic_pair(
+        torch.cat(correction.intermediate_frames), 1, 0, 2, batch_size=1
+    )
+    torch.testing.assert_close(diagnostic_binary[..., 0], first_cleaned[0, ..., 0].float())
+
+
 def test_correction_normalizes_latents_caches_reference_and_restores_each_prediction(
     anti_drift, monkeypatch
 ):
@@ -1456,7 +1587,7 @@ def test_empty_sparse_steps_skip_intermediate_correction_and_final_mask_falls_ba
     prediction[:, 0, 0] = 1
     final = anti_drift.finalize_image(
         torch.zeros_like(prediction), prediction, None, 0, 10, 0,
-        comparison_blur_pixels=0,
+        comparison_blur_pixels=0, min_mask_area=0,
     )
     assert final.dtype == torch.float32 and final.device.type == "cpu"
     torch.testing.assert_close(final[0, 0, 0], torch.ones(3))
@@ -1483,7 +1614,9 @@ def test_final_image_reuses_binary_mask_color_matches_background_and_keeps_exact
     assert not torch.equal(matched[0, 0, 5, :2], prediction[0, 0, 5, :2])
     assert matched[0, 0, 5, 2] == prediction[0, 0, 5, 2]
 
-    final = anti_drift.finalize_image(source, prediction, binary_mask, 0, 100, 0)
+    final = anti_drift.finalize_image(
+        source, prediction, binary_mask, 0, 100, 0, min_mask_area=0,
+    )
     assert final.dtype == torch.float32 and final.device.type == "cpu"
     outside = ~binary_mask[..., 0]
     assert torch.equal(final[outside], source[outside])
@@ -1584,7 +1717,7 @@ def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkey
     denoised = torch.zeros((2, 4, height, width))
     retained = anti_drift.AntiDriftCorrection(
         reference, VAE([first, reference, next_prediction, next_prediction]), 0, 10, 1,
-        dont_unmask_pixels=True, comparison_blur_pixels=0,
+        dont_unmask_pixels=True, comparison_blur_pixels=0, min_mask_area=0,
     )
     _enable_corrections(retained, 3)
     for _ in range(3):
@@ -1609,7 +1742,7 @@ def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkey
 
     shrinking = anti_drift.AntiDriftCorrection(
         reference, VAE([first, reference, next_prediction]), 0, 10, 1,
-        dont_unmask_pixels=False, comparison_blur_pixels=0,
+        dont_unmask_pixels=False, comparison_blur_pixels=0, min_mask_area=0,
     )
     _enable_corrections(shrinking, 2)
     for _ in range(2):
@@ -1659,7 +1792,7 @@ def test_post_cfg_encodes_color_matched_prediction_over_exact_source_background(
 
     vae = VAE()
     correction = anti_drift.AntiDriftCorrection(
-        reference, vae, 0, 10, 0, comparison_blur_pixels=0,
+        reference, vae, 0, 10, 0, comparison_blur_pixels=0, min_mask_area=0,
     )
     _enable_corrections(correction)
     correction.models = [object()]

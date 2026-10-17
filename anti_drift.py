@@ -4,6 +4,9 @@
 import math
 import re
 
+import numpy as np
+from scipy import ndimage
+
 import torch
 import torch.nn.functional as F
 from kornia.filters import bilateral_blur
@@ -89,6 +92,20 @@ def feather_mask(binary_mask, blur_pixels, mask_expand_pixels, dtype):
         mask = F.max_pool2d(mask.movedim(-1, 1), (1, kernel_size), stride=1, padding=(0, mask_expand_pixels))
         mask = F.max_pool2d(mask, (kernel_size, 1), stride=1, padding=(mask_expand_pixels, 0)).movedim(1, -1)
     return blur_image(mask, blur_pixels)
+
+
+def remove_small_mask_components(binary_mask, min_mask_area):
+    if min_mask_area <= 1:
+        return binary_mask
+    cleaned = torch.empty_like(binary_mask)
+    connectivity = np.ones((3, 3), dtype=np.uint8)
+    for index in range(binary_mask.shape[0]):
+        labels, count = ndimage.label(binary_mask[index, ..., 0].detach().cpu().numpy(), structure=connectivity)
+        sizes = np.bincount(labels.ravel(), minlength=count + 1)
+        keep = sizes >= min_mask_area
+        keep[0] = False
+        cleaned[index, ..., 0] = torch.from_numpy(keep[labels]).to(binary_mask.device)
+    return cleaned
 
 
 def detect_mask(prediction, blurred_reference, threshold_percent, comparison_blur_pixels, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0):
@@ -181,7 +198,7 @@ def diagnostic_frames(prediction, composite, display_mask, registration_mask, bi
     return frames
 
 
-def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, dont_unmask_pixels=False, diagnostic_output=None, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, comparison_reference=None):
+def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, dont_unmask_pixels=False, diagnostic_output=None, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, comparison_reference=None, min_mask_area=2):
     if prediction.ndim != 4 or prediction.shape[-1] < 3:
         raise ValueError("Anti-Drift requires an image VAE that decodes to [batch, height, width, RGB].")
     prediction = prediction[..., :3].detach().to(device="cpu", dtype=torch.float32, copy=True)
@@ -204,6 +221,7 @@ def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_perce
                 elif dont_unmask_pixels:
                     detected[index] |= binary_mask[index]
         binary_mask = detected
+    binary_mask = remove_small_mask_components(binary_mask, min_mask_area)
     mask_modes = []
     for needs_recalculation in recalculate:
         if not had_binary_mask:
@@ -221,13 +239,14 @@ def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_perce
 
 
 class AntiDriftCorrection:
-    def __init__(self, image1, vae, blur_pixels, threshold_percent=5.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, start_at_step=0, steps=20, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0):
+    def __init__(self, image1, vae, blur_pixels, threshold_percent=5.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, start_at_step=0, steps=20, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, min_mask_area=2):
         self.image1 = image1
         self.vae = vae
         self.blur_pixels = blur_pixels
         self.comparison_blur_pixels = comparison_blur_pixels
         self.comparison_filter = comparison_filter
         self.comparison_color_tolerance_percent = comparison_color_tolerance_percent
+        self.min_mask_area = min_mask_area
         self.threshold_percent = threshold_percent
         self.mask_expand_pixels = mask_expand_pixels
         self.correction_steps = parse_correction_steps(correction_steps, steps)
@@ -299,6 +318,7 @@ class AntiDriftCorrection:
             retained = self.dont_unmask_pixels and self.retained_mask is not None
             if retained:
                 binary_mask |= self.retained_mask
+            binary_mask = remove_small_mask_components(binary_mask, self.min_mask_area)
             output_mask = feather_mask(binary_mask, self.blur_pixels, self.mask_expand_pixels, prediction.dtype)
             aligned, mask = apply_alignment(prediction, transforms, self.reference, output_mask)
             corrected = compose_prediction(self.reference, aligned, mask)
@@ -349,13 +369,14 @@ class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
         inputs.setdefault("optional", {}).update({
             "comparison_filter": (["gaussian", "bilateral"], {"default": "gaussian", "tooltip": "Choose Gaussian smoothing or edge-preserving bilateral smoothing for RGB difference detection. Mask feathering remains Gaussian."}),
             "comparison_color_tolerance_percent": ("FLOAT", {"default": 10.0, "min": 0.01, "max": 100.0, "step": 0.1, "tooltip": "Bilateral color range standard deviation as a percentage of root-mean-square RGB difference, not a strict cutoff. Lower values preserve weaker edges; higher values smooth across more color differences. threshold_percent still decides which pixels count as edits."}),
+            "min_mask_area": ("INT", {"default": 2, "min": 0, "max": 1000000, "step": 1, "tooltip": "Remove 8-connected binary edit blobs smaller than this many decoded-image pixels before expansion. Diagonal pixels connect; 2 keeps pairs but removes isolated pixels. Zero or one disables cleanup."}),
         })
         return inputs
 
     DESCRIPTION = "Corrects selected clean denoised predictions against image1 during one uninterrupted native KSampler Advanced run."
 
-    def sample(self, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, image1, vae, blur_pixels=6.0, threshold_percent=5.0, denoise=1.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0):
-        correction = AntiDriftCorrection(image1, vae, blur_pixels, threshold_percent, mask_expand_pixels, correction_steps, dont_unmask_pixels, start_at_step, steps, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent)
+    def sample(self, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, image1, vae, blur_pixels=6.0, threshold_percent=5.0, denoise=1.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0, min_mask_area=2):
+        correction = AntiDriftCorrection(image1, vae, blur_pixels, threshold_percent, mask_expand_pixels, correction_steps, dont_unmask_pixels, start_at_step, steps, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent, min_mask_area)
         try:
             patched_model = model.clone()
             patched_model.set_model_sampler_post_cfg_function(correction)
@@ -367,7 +388,7 @@ class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
                 if comparison_reference is None:
                     comparison_reference = reconstruct_reference(prepare_reference(image1, prediction), vae)
                 final_frames = []
-                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels, dont_unmask_pixels, diagnostic_output=final_frames, comparison_filter=comparison_filter, comparison_color_tolerance_percent=comparison_color_tolerance_percent, comparison_reference=comparison_reference)
+                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels, dont_unmask_pixels, diagnostic_output=final_frames, comparison_filter=comparison_filter, comparison_color_tolerance_percent=comparison_color_tolerance_percent, comparison_reference=comparison_reference, min_mask_area=min_mask_area)
             preview = latent_preview.preview_to_image(final_image[0], do_scale=False)
             comfy.utils.ProgressBar(steps).update_absolute(steps, steps, ("JPEG", preview, None))
             intermediate_steps_and_masks = torch.cat([*correction.intermediate_frames, *final_frames], dim=0)
