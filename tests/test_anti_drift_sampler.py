@@ -535,10 +535,11 @@ def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
     predictions = [_translate(edited, 5, -4), _translate(edited, -3, 2)]
     decoded = []
     encoded = []
+    vae_outputs = [predictions[0], reference, predictions[1]]
 
     class VAE:
         def decode(self, samples):
-            image = predictions[len(decoded)]
+            image = vae_outputs[len(decoded)]
             decoded.append(image)
             return image
 
@@ -580,7 +581,9 @@ def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
 
     assert estimated_offsets[0][0] == pytest.approx((1.0, 1.0, 5, -4), abs=0.05)
     assert estimated_offsets[1][0] == pytest.approx((1.0, 1.0, -3, 2), abs=0.05)
-    assert len(decoded) == len(encoded) == 2
+    assert len(decoded) == len(encoded) == 3
+    torch.testing.assert_close(encoded[0], reference)
+    torch.testing.assert_close(correction.comparison_reference, reference)
     assert first_mask[0, 90, 90, 0]
     assert correction.last_binary_mask[0, 90, 90, 0]
     assert torch.all(correction.last_binary_mask[first_mask])
@@ -591,9 +594,54 @@ def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
     expanded_previous = anti_drift.feather_mask(first_mask, 6, 15, torch.float32) > 0
     assert expanded_previous.float().mean() > first_mask.float().mean() * 10
     assert torch.count_nonzero(registration_exclusions[1] & first_mask) == first_mask.sum()
-    for image, displaced_center in ((encoded[0], (99, 81)), (encoded[1], (82, 97))):
+    for image, displaced_center in ((encoded[-2], (99, 81)), (encoded[-1], (82, 97))):
         assert image[0, 90, 90].mean() > 0.8
         assert image[0, displaced_center[0], displaced_center[1]].mean() < 0.8
+
+
+def test_reconstructed_comparison_baseline_cancels_shared_vae_artifact(
+    anti_drift,
+):
+    height, width = 72, 80
+    source = _textured_image(height, width, seed=571)
+    yy = torch.linspace(0, 2 * torch.pi, height).reshape(1, height, 1, 1)
+    xx = torch.linspace(0, 3 * torch.pi, width).reshape(1, 1, width, 1)
+    artifact = 0.12 * torch.sin(yy + xx)
+    artifact = artifact.expand(1, height, width, 3) * torch.tensor([1.0, -0.7, 0.4])
+    encoded = []
+    decoded = []
+
+    class VAE:
+        def encode(self, image):
+            encoded.append(image.clone())
+            return image
+
+        def decode(self, samples):
+            decoded.append(samples)
+            return (samples + artifact).clamp(0, 1)
+
+    vae = VAE()
+    comparison_reference = anti_drift.reconstruct_reference(source, vae)
+    assert len(encoded) == len(decoded) == 1
+    torch.testing.assert_close(comparison_reference, (source + artifact).clamp(0, 1))
+
+    edited = source.clone()
+    edited[:, 29:42, 34:47] = 0.98
+    prediction = (edited + artifact).clamp(0, 1)
+    common_args = (source, prediction, None, 0, 8, 0)
+    without_baseline = anti_drift.finalize_image(
+        *common_args, comparison_blur_pixels=0,
+    )
+    with_baseline = anti_drift.finalize_image(
+        *common_args, comparison_blur_pixels=0,
+        comparison_reference=comparison_reference,
+    )
+
+    outside_edit = torch.ones((height, width), dtype=torch.bool)
+    outside_edit[29:42, 34:47] = False
+    assert torch.equal(with_baseline[0, outside_edit], source[0, outside_edit])
+    assert with_baseline[0, 35, 40].mean() > 0.9
+    assert (without_baseline[0, outside_edit] - source[0, outside_edit]).abs().mean() > 0.01
 
 
 def test_correction_normalizes_latents_caches_reference_and_restores_each_prediction(
@@ -644,13 +692,14 @@ def test_correction_normalizes_latents_caches_reference_and_restores_each_predic
     cached_reference = correction.reference
     second = correction(args)
 
-    assert len(decoded_inputs) == len(encoded_inputs) == 2
+    assert len(decoded_inputs) == len(encoded_inputs) == 3
     torch.testing.assert_close(decoded_inputs[0], original * 2)
     torch.testing.assert_close(encoded_inputs[0], torch.full_like(encoded_inputs[0], 0.25))
     torch.testing.assert_close(first, torch.full_like(first, 0.75))
     torch.testing.assert_close(second, first)
     assert first.dtype == original.dtype and first.device == original.device
     assert correction.reference is cached_reference
+    torch.testing.assert_close(correction.comparison_reference, torch.full_like(correction.reference, 0.7))
     assert correction.image1 is None
     assert len(restored) == 2
     assert restored == [
@@ -659,6 +708,8 @@ def test_correction_normalizes_latents_caches_reference_and_restores_each_predic
     ]
     assert len(correction.intermediate_frames) == 2
     assert correction.intermediate_frames[0].shape == (3, 34, 4, 3)
+    correction.clear()
+    assert correction.reference is None and correction.comparison_reference is None
 
 
 def test_correction_reuses_corrected_pixels_for_full_resolution_preview(
@@ -698,7 +749,7 @@ def test_correction_reuses_corrected_pixels_for_full_resolution_preview(
     correction.minimum_memory_required = 1
     correction({"denoised": torch.zeros((1, 4, height, width)), "model": Model(), "sigma": torch.tensor([1.0])})
 
-    assert len(decoded) == len(encoded) == 1
+    assert len(decoded) == len(encoded) == 2
     torch.testing.assert_close(encoded[0], torch.full_like(encoded[0], 0.25))
     assert correction.latest_preview.size == (width, height)
     assert correction.latest_preview.getpixel((0, 0)) == (63, 63, 63)
@@ -946,13 +997,14 @@ def test_sampler_returns_eval_major_corrected_and_feathered_mask_panels(
     )
     final_eval = torch.full((batch, height, width, 3), 0.5)
     predictions = [first_eval, second_eval, final_eval]
+    vae_outputs = [first_eval, reference[:1], second_eval, final_eval]
     decoded_inputs = []
     encoded_inputs = []
     captured = []
 
     class VAE:
         def decode(self, samples):
-            image = predictions[len(decoded_inputs)]
+            image = vae_outputs[len(decoded_inputs)]
             decoded_inputs.append(image)
             return image
 
@@ -1011,7 +1063,7 @@ def test_sampler_returns_eval_major_corrected_and_feathered_mask_panels(
     assert result_latent["samples"] is latent["samples"]
     assert result_latent["noise_mask"] is noise_mask
     assert result_latent["batch_index"] is latent["batch_index"]
-    assert len(decoded_inputs) == 3 and len(encoded_inputs) == 2
+    assert len(decoded_inputs) == 4 and len(encoded_inputs) == 3
     assert final_image.shape == (batch, height, width, 3)
     assert final_image.dtype == torch.float32 and final_image.device.type == "cpu"
     assert frames.shape == (3 * batch * 3, height + DIAGNOSTIC_HEADER_HEIGHT, width * 2, 3)
@@ -1123,7 +1175,7 @@ def test_sampler_delegates_once_with_advanced_controls_and_clears_correction(
 
         def encode(self, image):
             self.encode_calls += 1
-            raise AssertionError("final image must not be encoded")
+            return torch.zeros((1, 4, 2, 2))
 
     vae = VAE()
     sampler = anti_drift.EnvyKSamplerAdvancedAntiDrift()
@@ -1141,7 +1193,7 @@ def test_sampler_delegates_once_with_advanced_controls_and_clears_correction(
     assert result[2].shape == (1, 2, 2, 3)
     assert result[2].dtype == torch.float32 and result[2].device.type == "cpu"
     torch.testing.assert_close(result[2], torch.zeros_like(result[2]))
-    assert vae.decode_calls == 1 and vae.encode_calls == 0
+    assert vae.decode_calls == 2 and vae.encode_calls == 1
     assert result[1].dtype == torch.float32 and result[1].device.type == "cpu"
     raw, aligned = _diagnostic_pair(result[1], 0, 0, 0, 1)
     torch.testing.assert_close(raw, torch.zeros_like(raw))
@@ -1380,7 +1432,7 @@ def test_sparse_steps_use_truncated_original_schedule_once_per_sigma_interval(
     )
 
     assert result == "native-result"
-    assert vae.decode_calls == vae.encode_calls == 2
+    assert vae.decode_calls == vae.encode_calls == 3
     assert len(correction.intermediate_frames) == 2
     assert len(native_calls) == 4
     assert len(image_previews) == 2
@@ -1531,7 +1583,7 @@ def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkey
 
     denoised = torch.zeros((2, 4, height, width))
     retained = anti_drift.AntiDriftCorrection(
-        reference, VAE([first, next_prediction, next_prediction]), 0, 10, 1,
+        reference, VAE([first, reference, next_prediction, next_prediction]), 0, 10, 1,
         dont_unmask_pixels=True, comparison_blur_pixels=0,
     )
     _enable_corrections(retained, 3)
@@ -1556,7 +1608,7 @@ def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkey
     assert masks[2, 2] == masks[2, 2].round()
 
     shrinking = anti_drift.AntiDriftCorrection(
-        reference, VAE([first, next_prediction]), 0, 10, 1,
+        reference, VAE([first, reference, next_prediction]), 0, 10, 1,
         dont_unmask_pixels=False, comparison_blur_pixels=0,
     )
     _enable_corrections(shrinking, 2)
@@ -1591,7 +1643,7 @@ def test_post_cfg_encodes_color_matched_prediction_over_exact_source_background(
 
         def decode(self, samples):
             self.decode_calls += 1
-            return prediction
+            return prediction if self.decode_calls == 1 else reference
 
         def encode(self, image):
             self.encode_calls += 1
@@ -1619,16 +1671,16 @@ def test_post_cfg_encodes_color_matched_prediction_over_exact_source_background(
         "sigma": torch.tensor([1.0]),
     })
 
-    assert vae.decode_calls == vae.encode_calls == 1
-    assert len(encoded_images) == 1
+    assert vae.decode_calls == vae.encode_calls == 2
+    assert len(encoded_images) == 2
     binary_mask = torch.zeros((1, 1, 5, 1), dtype=torch.bool)
     binary_mask[0, 0, 2, 0] = True
     expected_matched = anti_drift.match_background_color(
         prediction, reference, binary_mask.float()
     )
     outside = ~binary_mask[..., 0]
-    assert torch.equal(encoded_images[0][outside], reference[outside])
-    torch.testing.assert_close(encoded_images[0][0, 0, 2], expected_matched[0, 0, 2])
+    assert torch.equal(encoded_images[-1][outside], reference[outside])
+    torch.testing.assert_close(encoded_images[-1][0, 0, 2], expected_matched[0, 0, 2])
     assert correction.last_binary_mask[0, 0, 2, 0]
     assert torch.count_nonzero(correction.last_binary_mask) == 1
 
@@ -1684,7 +1736,7 @@ def test_comparison_blur_changes_detection_not_feathering_or_cached_reference(
     class VAE:
         def decode(self, samples):
             decoded.append(samples)
-            return prediction
+            return prediction if len(decoded) == 1 else reference
 
         def encode(self, image):
             encoded.append(image.clone())
@@ -1709,9 +1761,9 @@ def test_comparison_blur_changes_detection_not_feathering_or_cached_reference(
         "model": Model(),
         "sigma": torch.tensor([1.0]),
     })
-    assert len(decoded) == len(encoded) == 1
+    assert len(decoded) == len(encoded) == 2
     torch.testing.assert_close(correction.blurred_reference, anti_drift.blur_image(reference, 2))
-    torch.testing.assert_close(encoded[0], detected)
+    torch.testing.assert_close(encoded[-1], detected)
 
     fallback_detected = anti_drift.finalize_image(
         reference, prediction, None, 6, 5, 15, comparison_blur_pixels=2,
@@ -1854,7 +1906,7 @@ def test_bilateral_correction_caches_reference_filter_and_keeps_vae_call_count(
     original_detect = anti_drift.detect_mask
 
     def count_reference_filter(image, *args):
-        if correction.reference is not None and image.data_ptr() == correction.reference.data_ptr():
+        if correction.comparison_reference is not None and image.data_ptr() == correction.comparison_reference.data_ptr():
             cached_reference_calls.append(image)
         return original_filter(image, *args)
 
@@ -1875,11 +1927,12 @@ def test_bilateral_correction_caches_reference_filter_and_keeps_vae_call_count(
         reference, prediction, correction.last_binary_mask, 6, 5, 15,
         comparison_blur_pixels=2, comparison_filter="bilateral",
         comparison_color_tolerance_percent=10,
+        comparison_reference=correction.comparison_reference,
     )
 
     assert len(cached_reference_calls) == 1
     assert correction.blurred_reference is cached
-    assert len(decoded) == len(encoded) == 2
+    assert len(decoded) == len(encoded) == 3
     assert comparison_modes and set(comparison_modes) == {"bilateral"}
     assert final.shape == prediction.shape
     assert torch.isfinite(final).all()
