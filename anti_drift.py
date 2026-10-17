@@ -187,7 +187,7 @@ def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_perce
         binary_mask = binary_mask.detach().to(device="cpu")
     had_binary_mask = binary_mask is not None
     registration_masks = [] if diagnostic_output is not None else None
-    previous_mask = None if binary_mask is None else feather_mask(binary_mask, blur_pixels, mask_expand_pixels, prediction.dtype) > 0
+    previous_mask = binary_mask
     transforms = alignment_transforms(reference, prediction, filtered_reference, threshold_percent, comparison_blur_pixels, previous_mask, registration_masks, comparison_filter, comparison_color_tolerance_percent)
     recalculate = [displacement > 1 / 3 for displacement in alignment_displacement(transforms, *prediction.shape[1:3])]
     if binary_mask is None or any(recalculate):
@@ -286,7 +286,7 @@ class AntiDriftCorrection:
                 self.blurred_reference = filter_comparison_image(self.reference, self.comparison_blur_pixels, self.comparison_filter, self.comparison_color_tolerance_percent)
                 self.image1 = None
             registration_masks = []
-            previous_mask = None if self.last_binary_mask is None else feather_mask(self.last_binary_mask, self.blur_pixels, self.mask_expand_pixels, prediction.dtype) > 0
+            previous_mask = self.last_binary_mask
             transforms = alignment_transforms(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, previous_mask, registration_masks, self.comparison_filter, self.comparison_color_tolerance_percent)
             binary_mask, recalculate = output_binary_mask(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, transforms, self.comparison_filter, self.comparison_color_tolerance_percent)
             retained = self.dont_unmask_pixels and self.retained_mask is not None

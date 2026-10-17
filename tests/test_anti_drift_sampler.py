@@ -554,7 +554,7 @@ def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
             return samples
 
     correction = anti_drift.AntiDriftCorrection(
-        reference, VAE(), 0, 10, 0, dont_unmask_pixels=True,
+        reference, VAE(), 6, 10, 15, dont_unmask_pixels=True,
         comparison_blur_pixels=4,
     )
     _enable_corrections(correction, 2)
@@ -562,11 +562,14 @@ def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
     correction.memory_required = 1
     correction.minimum_memory_required = 1
     estimated_offsets = []
+    registration_exclusions = []
     estimate = anti_drift.alignment_transforms
 
     def capture_offsets(*args, **kwargs):
+        masks = args[6]
         offsets = estimate(*args, **kwargs)
         estimated_offsets.append(offsets)
+        registration_exclusions.extend(masks)
         return offsets
 
     monkeypatch.setattr(anti_drift, "alignment_transforms", capture_offsets)
@@ -581,6 +584,13 @@ def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
     assert first_mask[0, 90, 90, 0]
     assert correction.last_binary_mask[0, 90, 90, 0]
     assert torch.all(correction.last_binary_mask[first_mask])
+    expected_second_exclusion = anti_drift.detect_mask(
+        predictions[1], correction.blurred_reference, 10, 4
+    ) | first_mask
+    assert torch.equal(registration_exclusions[1], expected_second_exclusion)
+    expanded_previous = anti_drift.feather_mask(first_mask, 6, 15, torch.float32) > 0
+    assert expanded_previous.float().mean() > first_mask.float().mean() * 10
+    assert torch.count_nonzero(registration_exclusions[1] & first_mask) == first_mask.sum()
     for image, displaced_center in ((encoded[0], (99, 81)), (encoded[1], (82, 97))):
         assert image[0, 90, 90].mean() > 0.8
         assert image[0, displaced_center[0], displaced_center[1]].mean() < 0.8
@@ -1431,6 +1441,59 @@ def test_final_image_reuses_binary_mask_color_matches_background_and_keeps_exact
         prediction, reference, torch.ones_like(binary_mask, dtype=torch.float32)
     )
     torch.testing.assert_close(no_background, prediction)
+
+
+def test_final_registration_uses_unexpanded_previous_binary_with_redetection(
+    anti_drift, monkeypatch
+):
+    height, width = 224, 240
+    reference = _analytic_texture(height, width)
+    transform = (1.006, 0.992, 1.2, -1.3)
+    prediction = _analytic_raw_for_alignment(height, width, transform)
+    previous = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    previous[:, 40:58, 40:62] = True
+    current = torch.zeros_like(previous)
+    current[:, 155:174, 170:193] = True
+    prediction[previous.expand_as(prediction)] = 0.98
+    prediction[current.expand_as(prediction)] = 0.02
+
+    detection_calls = []
+
+    def detect_current(*args, **kwargs):
+        detection_calls.append(None)
+        return current.clone()
+
+    monkeypatch.setattr(anti_drift, "detect_mask", detect_current)
+    original_estimate = anti_drift.estimate_alignment
+    observed_exclusions = []
+    observed_transforms = []
+
+    def capture_estimate(reference, prediction, exclusion_mask=None):
+        observed_exclusions.append(exclusion_mask.clone())
+        transforms = original_estimate(reference, prediction, exclusion_mask)
+        observed_transforms.extend(transforms)
+        return transforms
+
+    monkeypatch.setattr(anti_drift, "estimate_alignment", capture_estimate)
+    diagnostics = []
+    composite = anti_drift.finalize_image(
+        reference, prediction, previous, 4, 10, 15, comparison_blur_pixels=0,
+        dont_unmask_pixels=True, diagnostic_output=diagnostics,
+    )
+
+    expected_exclusion = previous | current
+    assert torch.equal(observed_exclusions[0], expected_exclusion)
+    assert _max_corner_error(observed_transforms[0], transform, height, width) < 0.5
+    assert _max_corner_error(observed_transforms[0], (1.0, 1.0, 0.0, 0.0), height, width) > 1 / 3
+    assert len(detection_calls) == 3  # provisional, initial mask, and post-alignment redetection
+    frame = diagnostics[0][0]
+    assert frame.shape == (height + 32, width * 2, 3)
+    assert torch.equal(diagnostics[0][2, 32:, width:, :1] >= 0.5, expected_exclusion[0])
+    assert torch.equal(diagnostics[0][2, 32:, :width, :1] >= 0.5, expected_exclusion[0])
+    displayed = diagnostics[0][1, 32:, width:, :1]
+    zero = displayed[..., 0] == 0
+    assert torch.equal(composite[0][zero], reference[0][zero])
+    assert (displayed > 0).float().mean() > expected_exclusion.float().mean() * 10
 
 
 def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkeypatch):
