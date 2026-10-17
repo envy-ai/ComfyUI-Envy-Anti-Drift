@@ -306,6 +306,8 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     assert schema["dont_unmask_pixels"][1]["default"] is False
     assert schema["comparison_blur_pixels"][1]["default"] == 2.0
     all_inputs = {**schema, **anti_drift.EnvyKSamplerAdvancedAntiDrift.INPUT_TYPES().get("optional", {})}
+    assert all_inputs["comparison_filter"][1]["default"] == "gaussian"
+    assert all_inputs["comparison_color_tolerance_percent"][1]["default"] == 10.0
     assert "align_background" not in all_inputs
     assert "use_ecc_alignment" not in all_inputs
     assert "feather" in schema["blur_pixels"][1]["tooltip"].lower()
@@ -316,6 +318,8 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     assert defaults.mask_expand_pixels == 15
     assert defaults.dont_unmask_pixels is False
     assert defaults.comparison_blur_pixels == 2.0
+    assert defaults.comparison_filter == "gaussian"
+    assert defaults.comparison_color_tolerance_percent == 10.0
 
 
 @pytest.mark.parametrize("sy,sx,dy,dx", [(1.018, 0.986, 2.4, -3.2), (0.982, 1.014, -2.2, 3.1)])
@@ -1654,3 +1658,175 @@ def test_comparison_blur_changes_detection_not_feathering_or_cached_reference(
     )
     assert fallback_detected[0, height // 2, width // 2, 0] > 0.7
     assert fallback_suppressed[0, height // 2, width // 2, 0] == reference[0, height // 2, width // 2, 0]
+
+
+def test_bilateral_comparison_preserves_added_and_removed_fine_lines(anti_drift):
+    height, width = 65, 67
+    reference = torch.full((1, height, width, 3), 0.2)
+    reference[:, :, 20] = 0.9
+    prediction = reference.clone()
+    prediction[:, :, 20] = 0.2
+    prediction[:, :, 44] = 0.9
+
+    gaussian_reference = anti_drift.filter_comparison_image(reference, 2, "gaussian", 10)
+    bilateral_reference = anti_drift.filter_comparison_image(reference, 2, "bilateral", 10)
+    gaussian_mask = anti_drift.detect_mask(
+        prediction, gaussian_reference, 15, 2, "gaussian", 10
+    )
+    bilateral_mask = anti_drift.detect_mask(
+        prediction, bilateral_reference, 15, 2, "bilateral", 10
+    )
+
+    assert not gaussian_mask.any()
+    assert bilateral_mask[0, height // 2, 20, 0]
+    assert bilateral_mask[0, height // 2, 44, 0]
+
+
+def test_bilateral_comparison_suppresses_low_amplitude_noise_and_zero_bypasses(anti_drift):
+    height, width = 51, 53
+    reference = torch.full((2, height, width, 3), 0.4)
+    generator = torch.Generator().manual_seed(773)
+    noise = torch.randn(reference.shape, generator=generator) * 0.05
+    prediction = (reference + noise).clamp(0, 1)
+    filtered_reference = anti_drift.filter_comparison_image(reference, 2, "bilateral", 10)
+    filtered_prediction = anti_drift.filter_comparison_image(prediction, 2, "bilateral", 10)
+    filtered_error = (filtered_prediction - filtered_reference).abs().mean(dim=-1, keepdim=True)
+    unfiltered_error = (prediction - reference).abs().mean(dim=-1, keepdim=True)
+    binary = anti_drift.detect_mask(prediction, filtered_reference, 5, 2, "bilateral", 10)
+
+    assert unfiltered_error.mean() > 0.03
+    assert (unfiltered_error > 0.05).any()
+    assert filtered_error.mean() < unfiltered_error.mean()
+    raw_noise_mask = unfiltered_error > 0.05
+    assert binary.float().mean() < raw_noise_mask.float().mean() * 0.25
+    for mode in ("gaussian", "bilateral"):
+        assert anti_drift.filter_comparison_image(prediction, 0, mode, 10) is prediction
+    assert anti_drift.filter_comparison_image(
+        prediction, 2, "gaussian", 10
+    ) is not prediction
+
+
+def test_bilateral_tiles_match_full_kornia_at_tile_seams(anti_drift, monkeypatch):
+    bilateral_blur = anti_drift.bilateral_blur
+    radius = 6
+    kernel_size = radius * 2 + 1
+    generator = torch.Generator().manual_seed(181)
+    image = torch.rand((2, 29, 37, 3), generator=generator)
+    call_shapes = []
+
+    def counted_blur(tile, *args, **kwargs):
+        call_shapes.append(tile.shape)
+        return bilateral_blur(tile, *args, **kwargs)
+
+    monkeypatch.setattr(anti_drift.math, "isqrt", lambda _: 2 * radius + 5)
+    monkeypatch.setattr(anti_drift, "bilateral_blur", counted_blur)
+    tiled = anti_drift.filter_comparison_image(image, 2, "bilateral", 10)
+    full = bilateral_blur(
+        image.movedim(-1, 1), (kernel_size, kernel_size), 0.1 * math.sqrt(3),
+        (2, 2), border_type="replicate", color_distance_type="l2",
+    ).movedim(1, -1).contiguous()
+
+    assert len(call_shapes) > 4
+    torch.testing.assert_close(tiled, full, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_bilateral_filter_preserves_batch_device_dtype_and_finiteness(anti_drift, dtype):
+    image = torch.rand((2, 13, 17, 3), dtype=dtype)
+
+    filtered = anti_drift.filter_comparison_image(image, 1, "bilateral", 10)
+
+    assert filtered.shape == image.shape
+    assert filtered.dtype == image.dtype
+    assert filtered.device == image.device
+    assert torch.isfinite(filtered).all()
+
+
+def test_bilateral_correction_caches_reference_filter_and_keeps_vae_call_count(
+    anti_drift, monkeypatch
+):
+    import comfy.model_management
+    import comfy.model_prefetch
+
+    monkeypatch.setattr(comfy.model_prefetch, "pause_malloc_graph", nullcontext)
+    monkeypatch.setattr(comfy.model_management, "load_models_gpu", lambda *args, **kwargs: None)
+    height, width = 48, 52
+    reference = _textured_image(height, width, seed=889)
+    prediction = _translate(reference, 0, 3)
+    prediction[:, 18:30, 26] = 0.98
+    decoded = []
+    encoded = []
+
+    class VAE:
+        def decode(self, samples):
+            decoded.append(samples)
+            return prediction
+
+        def encode(self, image):
+            encoded.append(image.clone())
+            return torch.zeros((1, 4, height, width))
+
+    class Model:
+        def process_latent_out(self, samples):
+            return samples
+
+        def process_latent_in(self, samples):
+            return samples
+
+    correction = anti_drift.AntiDriftCorrection(
+        reference, VAE(), 6, 5, 15, comparison_blur_pixels=2,
+        comparison_filter="bilateral", comparison_color_tolerance_percent=10,
+    )
+    _enable_corrections(correction, 2)
+    correction.models = [object()]
+    correction.memory_required = 0
+    correction.minimum_memory_required = 0
+    monkeypatch.setattr(
+        anti_drift, "estimate_alignment",
+        lambda reference, prediction, exclusion_mask=None: [(1.0, 1.0, 0.0, 3.0)] * prediction.shape[0],
+    )
+    original_filter = anti_drift.filter_comparison_image
+    cached_reference_calls = []
+    comparison_modes = []
+    original_detect = anti_drift.detect_mask
+
+    def count_reference_filter(image, *args):
+        if correction.reference is not None and image.data_ptr() == correction.reference.data_ptr():
+            cached_reference_calls.append(image)
+        return original_filter(image, *args)
+
+    def track_comparison_mode(*args, **kwargs):
+        comparison_modes.append(args[4] if len(args) > 4 else kwargs["comparison_filter"])
+        return original_detect(*args, **kwargs)
+
+    monkeypatch.setattr(anti_drift, "filter_comparison_image", count_reference_filter)
+    monkeypatch.setattr(anti_drift, "detect_mask", track_comparison_mode)
+    args = {
+        "denoised": torch.zeros((1, 4, height, width)),
+        "model": Model(), "sigma": torch.tensor([1.0]),
+    }
+    correction(args)
+    cached = correction.blurred_reference
+    correction(args)
+    final = anti_drift.finalize_image(
+        reference, prediction, correction.last_binary_mask, 6, 5, 15,
+        comparison_blur_pixels=2, comparison_filter="bilateral",
+        comparison_color_tolerance_percent=10,
+    )
+
+    assert len(cached_reference_calls) == 1
+    assert correction.blurred_reference is cached
+    assert len(decoded) == len(encoded) == 2
+    assert comparison_modes and set(comparison_modes) == {"bilateral"}
+    assert final.shape == prediction.shape
+    assert torch.isfinite(final).all()
+    binary = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    binary[:, 20:25, 22:28] = True
+    feathered = anti_drift.feather_mask(binary, 6, 15, torch.float32)
+    expanded = torch.nn.functional.max_pool2d(
+        binary.float().movedim(-1, 1), (1, 31), stride=1, padding=(0, 15)
+    )
+    expanded = torch.nn.functional.max_pool2d(
+        expanded, (31, 1), stride=1, padding=(15, 0)
+    ).movedim(1, -1)
+    torch.testing.assert_close(feathered, anti_drift.blur_image(expanded, 6))

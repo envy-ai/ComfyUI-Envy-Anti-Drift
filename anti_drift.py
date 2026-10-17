@@ -6,6 +6,7 @@ import re
 
 import torch
 import torch.nn.functional as F
+from kornia.filters import bilateral_blur
 from PIL import Image, ImageDraw
 from torchvision.transforms.functional import gaussian_blur
 
@@ -34,6 +35,41 @@ def blur_image(image, blur_pixels):
     return image.movedim(1, -1).contiguous()
 
 
+def filter_comparison_image(image, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent):
+    if comparison_blur_pixels == 0:
+        return image
+    if comparison_filter == "gaussian":
+        return blur_image(image, comparison_blur_pixels)
+    if comparison_filter != "bilateral":
+        raise ValueError(f"Unknown comparison filter {comparison_filter!r}.")
+    if comparison_color_tolerance_percent <= 0:
+        raise ValueError("Bilateral comparison color tolerance must be greater than zero.")
+
+    radius = math.ceil(3 * comparison_blur_pixels)
+    kernel_size = radius * 2 + 1
+    channels = image.shape[-1]
+    height, width = image.shape[1:3]
+    bytes_per_pixel = image.element_size() * kernel_size ** 2 * (3 * channels + 4)
+    tile_budget = 256 * 1024 * 1024
+    tile_size = max(1, math.isqrt(tile_budget // bytes_per_pixel) - 2 * radius)
+    sigma_color = comparison_color_tolerance_percent / 100 * math.sqrt(3)
+    source = image.movedim(-1, 1)
+    result = torch.empty_like(source)
+    for batch_index in range(image.shape[0]):
+        for top in range(0, height, tile_size):
+            bottom = min(top + tile_size, height)
+            halo_top = max(0, top - radius)
+            halo_bottom = min(height, bottom + radius)
+            for left in range(0, width, tile_size):
+                right = min(left + tile_size, width)
+                halo_left = max(0, left - radius)
+                halo_right = min(width, right + radius)
+                tile = source[batch_index:batch_index + 1, :, halo_top:halo_bottom, halo_left:halo_right]
+                filtered = bilateral_blur(tile, (kernel_size, kernel_size), sigma_color, (comparison_blur_pixels, comparison_blur_pixels), border_type="replicate", color_distance_type="l2")
+                result[batch_index:batch_index + 1, :, top:bottom, left:right] = filtered[:, :, top - halo_top:bottom - halo_top, left - halo_left:right - halo_left]
+    return result.movedim(1, -1).contiguous()
+
+
 def prepare_reference(image1, prediction):
     reference = image1[:1, :, :, :3]
     height, width = prediction.shape[1:3]
@@ -51,8 +87,8 @@ def feather_mask(binary_mask, blur_pixels, mask_expand_pixels, dtype):
     return blur_image(mask, blur_pixels)
 
 
-def detect_mask(prediction, blurred_reference, threshold_percent, comparison_blur_pixels):
-    difference = (blur_image(prediction, comparison_blur_pixels) - blurred_reference).abs().mean(dim=-1, keepdim=True)
+def detect_mask(prediction, blurred_reference, threshold_percent, comparison_blur_pixels, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0):
+    difference = (filter_comparison_image(prediction, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent) - blurred_reference).abs().mean(dim=-1, keepdim=True)
     return difference > threshold_percent / 100
 
 
@@ -86,8 +122,8 @@ def parse_correction_steps(value, steps):
     return result
 
 
-def alignment_transforms(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, previous_mask=None, registration_masks=None):
-    provisional = detect_mask(prediction, blurred_reference, threshold_percent, comparison_blur_pixels)
+def alignment_transforms(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, previous_mask=None, registration_masks=None, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0):
+    provisional = detect_mask(prediction, blurred_reference, threshold_percent, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent)
     if previous_mask is not None:
         provisional |= previous_mask
     if registration_masks is not None:
@@ -95,14 +131,14 @@ def alignment_transforms(reference, prediction, blurred_reference, threshold_per
     return estimate_alignment(reference, prediction, provisional)
 
 
-def output_binary_mask(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, transforms):
-    binary = shift_mask(detect_mask(prediction, blurred_reference, threshold_percent, comparison_blur_pixels), transforms)
+def output_binary_mask(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, transforms, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0):
+    binary = shift_mask(detect_mask(prediction, blurred_reference, threshold_percent, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent), transforms)
     recalculate = [displacement > 1 / 3 for displacement in alignment_displacement(transforms, *prediction.shape[1:3])]
     if any(recalculate):
         aligned, coverage = warp_image(prediction, transforms)
         measurement = torch.where(coverage > 0.999, aligned, reference)
         valid = blur_image(coverage, comparison_blur_pixels) > 0.999
-        detected = detect_mask(measurement, blurred_reference, threshold_percent, comparison_blur_pixels) & valid
+        detected = detect_mask(measurement, blurred_reference, threshold_percent, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent) & valid
         for index, needs_recalculation in enumerate(recalculate):
             if needs_recalculation:
                 binary[index] = detected[index]
@@ -141,21 +177,21 @@ def diagnostic_frames(prediction, composite, display_mask, registration_mask, bi
     return frames
 
 
-def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, dont_unmask_pixels=False, diagnostic_output=None):
+def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, dont_unmask_pixels=False, diagnostic_output=None, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0):
     if prediction.ndim != 4 or prediction.shape[-1] < 3:
         raise ValueError("Anti-Drift requires an image VAE that decodes to [batch, height, width, RGB].")
     prediction = prediction[..., :3].detach().to(device="cpu", dtype=torch.float32, copy=True)
     reference = prepare_reference(image1, prediction)
-    blurred_reference = blur_image(reference, comparison_blur_pixels)
+    filtered_reference = filter_comparison_image(reference, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent)
     if binary_mask is not None:
         binary_mask = binary_mask.detach().to(device="cpu")
     had_binary_mask = binary_mask is not None
     registration_masks = [] if diagnostic_output is not None else None
     previous_mask = None if binary_mask is None else feather_mask(binary_mask, blur_pixels, mask_expand_pixels, prediction.dtype) > 0
-    transforms = alignment_transforms(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, previous_mask, registration_masks)
+    transforms = alignment_transforms(reference, prediction, filtered_reference, threshold_percent, comparison_blur_pixels, previous_mask, registration_masks, comparison_filter, comparison_color_tolerance_percent)
     recalculate = [displacement > 1 / 3 for displacement in alignment_displacement(transforms, *prediction.shape[1:3])]
     if binary_mask is None or any(recalculate):
-        detected, recalculate = output_binary_mask(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, transforms)
+        detected, recalculate = output_binary_mask(reference, prediction, filtered_reference, threshold_percent, comparison_blur_pixels, transforms, comparison_filter, comparison_color_tolerance_percent)
         if binary_mask is not None:
             for index, needs_recalculation in enumerate(recalculate):
                 if not needs_recalculation:
@@ -180,11 +216,13 @@ def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_perce
 
 
 class AntiDriftCorrection:
-    def __init__(self, image1, vae, blur_pixels, threshold_percent=5.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, start_at_step=0, steps=20, comparison_blur_pixels=2.0):
+    def __init__(self, image1, vae, blur_pixels, threshold_percent=5.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, start_at_step=0, steps=20, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0):
         self.image1 = image1
         self.vae = vae
         self.blur_pixels = blur_pixels
         self.comparison_blur_pixels = comparison_blur_pixels
+        self.comparison_filter = comparison_filter
+        self.comparison_color_tolerance_percent = comparison_color_tolerance_percent
         self.threshold_percent = threshold_percent
         self.mask_expand_pixels = mask_expand_pixels
         self.correction_steps = parse_correction_steps(correction_steps, steps)
@@ -245,12 +283,12 @@ class AntiDriftCorrection:
             prediction = prediction[..., :3]
             if self.reference is None:
                 self.reference = prepare_reference(self.image1, prediction)
-                self.blurred_reference = blur_image(self.reference, self.comparison_blur_pixels)
+                self.blurred_reference = filter_comparison_image(self.reference, self.comparison_blur_pixels, self.comparison_filter, self.comparison_color_tolerance_percent)
                 self.image1 = None
             registration_masks = []
             previous_mask = None if self.last_binary_mask is None else feather_mask(self.last_binary_mask, self.blur_pixels, self.mask_expand_pixels, prediction.dtype) > 0
-            transforms = alignment_transforms(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, previous_mask, registration_masks)
-            binary_mask, recalculate = output_binary_mask(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, transforms)
+            transforms = alignment_transforms(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, previous_mask, registration_masks, self.comparison_filter, self.comparison_color_tolerance_percent)
+            binary_mask, recalculate = output_binary_mask(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, transforms, self.comparison_filter, self.comparison_color_tolerance_percent)
             retained = self.dont_unmask_pixels and self.retained_mask is not None
             if retained:
                 binary_mask |= self.retained_mask
@@ -298,14 +336,18 @@ class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
             "mask_expand_pixels": ("INT", {"default": 15, "min": 0, "max": 10000, "step": 1, "tooltip": "Expand the binary edit mask by this many pixels on each side before Gaussian feathering. Zero disables expansion."}),
             "correction_steps": ("STRING", {"default": "0.4,0.999", "tooltip": "Steps separated by spaces or commas. Zero-based whole numbers select absolute steps; fractions between 0 and 1 multiply the full configured steps and round down (0.999 × 25 → 24). Mixed values work; duplicates run once. Uses the first evaluation in each selected noise interval. Empty disables intermediate correction."}),
             "dont_unmask_pixels": ("BOOLEAN", {"default": False, "display_name": "don't unmask pixels", "tooltip": "Keep every binary edit-mask location detected at selected correction steps. Retains mask locations only; predicted pixels continue changing."}),
-            "comparison_blur_pixels": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10000.0, "step": 1.0, "tooltip": "Gaussian standard deviation in pixels for RGB difference detection only. Zero compares unblurred images; mask feathering uses blur_pixels."}),
+            "comparison_blur_pixels": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10000.0, "step": 1.0, "tooltip": "Spatial standard deviation in pixels for RGB difference detection only. Zero compares unblurred images; mask feathering uses blur_pixels."}),
+        })
+        inputs.setdefault("optional", {}).update({
+            "comparison_filter": (["gaussian", "bilateral"], {"default": "gaussian", "tooltip": "Choose Gaussian smoothing or edge-preserving bilateral smoothing for RGB difference detection. Mask feathering remains Gaussian."}),
+            "comparison_color_tolerance_percent": ("FLOAT", {"default": 10.0, "min": 0.01, "max": 100.0, "step": 0.1, "tooltip": "Bilateral color range standard deviation as a percentage of root-mean-square RGB difference, not a strict cutoff. Lower values preserve weaker edges; higher values smooth across more color differences. threshold_percent still decides which pixels count as edits."}),
         })
         return inputs
 
     DESCRIPTION = "Corrects selected clean denoised predictions against image1 during one uninterrupted native KSampler Advanced run."
 
-    def sample(self, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, image1, vae, blur_pixels=6.0, threshold_percent=5.0, denoise=1.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, comparison_blur_pixels=2.0):
-        correction = AntiDriftCorrection(image1, vae, blur_pixels, threshold_percent, mask_expand_pixels, correction_steps, dont_unmask_pixels, start_at_step, steps, comparison_blur_pixels)
+    def sample(self, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, image1, vae, blur_pixels=6.0, threshold_percent=5.0, denoise=1.0, mask_expand_pixels=15, correction_steps="0.4,0.999", dont_unmask_pixels=False, comparison_blur_pixels=2.0, comparison_filter="gaussian", comparison_color_tolerance_percent=10.0):
+        correction = AntiDriftCorrection(image1, vae, blur_pixels, threshold_percent, mask_expand_pixels, correction_steps, dont_unmask_pixels, start_at_step, steps, comparison_blur_pixels, comparison_filter, comparison_color_tolerance_percent)
         try:
             patched_model = model.clone()
             patched_model.set_model_sampler_post_cfg_function(correction)
@@ -314,7 +356,7 @@ class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
             with comfy.model_prefetch.pause_malloc_graph():
                 prediction = vae.decode(result[0]["samples"])
                 final_frames = []
-                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels, dont_unmask_pixels, diagnostic_output=final_frames)
+                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels, dont_unmask_pixels, diagnostic_output=final_frames, comparison_filter=comparison_filter, comparison_color_tolerance_percent=comparison_color_tolerance_percent)
             preview = latent_preview.preview_to_image(final_image[0], do_scale=False)
             comfy.utils.ProgressBar(steps).update_absolute(steps, steps, ("JPEG", preview, None))
             intermediate_steps_and_masks = torch.cat([*correction.intermediate_frames, *final_frames], dim=0)
