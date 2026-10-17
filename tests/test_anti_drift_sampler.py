@@ -2001,6 +2001,28 @@ def test_bilateral_filter_preserves_batch_device_dtype_and_finiteness(anti_drift
     assert torch.isfinite(filtered).all()
 
 
+def test_bilateral_cpu_input_stays_on_cpu_when_configured_device_is_cpu(
+    anti_drift, monkeypatch
+):
+    import comfy.model_management
+
+    monkeypatch.setattr(comfy.model_management, "get_torch_device", lambda: torch.device("cpu"))
+    input_devices = []
+    bilateral = anti_drift.bilateral_blur
+
+    def capture_device(tile, *args, **kwargs):
+        input_devices.append(tile.device.type)
+        return bilateral(tile, *args, **kwargs)
+
+    monkeypatch.setattr(anti_drift, "bilateral_blur", capture_device)
+    image = torch.rand((1, 12, 15, 3), dtype=torch.float64)
+
+    filtered = anti_drift.filter_comparison_image(image, 1, "bilateral", 10)
+
+    assert input_devices and set(input_devices) == {"cpu"}
+    assert filtered.device.type == "cpu" and filtered.dtype == torch.float64
+
+
 def test_bilateral_correction_caches_reference_filter_and_keeps_vae_call_count(
     anti_drift, monkeypatch
 ):

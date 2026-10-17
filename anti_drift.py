@@ -53,11 +53,18 @@ def filter_comparison_image(image, comparison_blur_pixels, comparison_filter, co
     channels = image.shape[-1]
     height, width = image.shape[1:3]
     bytes_per_pixel = image.element_size() * kernel_size ** 2 * (3 * channels + 4)
-    tile_budget = 256 * 1024 * 1024
-    tile_size = max(1, math.isqrt(tile_budget // bytes_per_pixel) - 2 * radius)
     sigma_color = comparison_color_tolerance_percent / 100 * math.sqrt(3)
     source = image.movedim(-1, 1)
     result = torch.empty_like(source)
+    compute_device = image.device
+    if image.device.type == "cpu":
+        configured_device = comfy.model_management.get_torch_device()
+        if configured_device.type == "cuda":
+            compute_device = configured_device
+    tile_budget = 256 * 1024 * 1024
+    if compute_device.type != "cpu":
+        tile_budget = min(tile_budget, int(comfy.model_management.get_free_memory(compute_device) // 4))
+    tile_size = max(1, math.isqrt(tile_budget // bytes_per_pixel) - 2 * radius)
     for batch_index in range(image.shape[0]):
         for top in range(0, height, tile_size):
             bottom = min(top + tile_size, height)
@@ -68,8 +75,11 @@ def filter_comparison_image(image, comparison_blur_pixels, comparison_filter, co
                 halo_left = max(0, left - radius)
                 halo_right = min(width, right + radius)
                 tile = source[batch_index:batch_index + 1, :, halo_top:halo_bottom, halo_left:halo_right]
+                if compute_device != image.device:
+                    tile = tile.to(device=compute_device)
                 filtered = bilateral_blur(tile, (kernel_size, kernel_size), sigma_color, (comparison_blur_pixels, comparison_blur_pixels), border_type="replicate", color_distance_type="l2")
-                result[batch_index:batch_index + 1, :, top:bottom, left:right] = filtered[:, :, top - halo_top:bottom - halo_top, left - halo_left:right - halo_left]
+                result[batch_index:batch_index + 1, :, top:bottom, left:right] = filtered[:, :, top - halo_top:bottom - halo_top, left - halo_left:right - halo_left].to(device=image.device)
+                del filtered, tile
     return result.movedim(1, -1).contiguous()
 
 
