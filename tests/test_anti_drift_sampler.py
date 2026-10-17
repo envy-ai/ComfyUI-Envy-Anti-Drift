@@ -14,6 +14,14 @@ from PIL import Image
 
 
 PACK_ROOT = Path(__file__).resolve().parents[1]
+DIAGNOSTIC_HEADER_HEIGHT = 32
+
+
+def _diagnostic_pair(frames, evaluation, batch_index, pair_index, batch_size):
+    frame_index = evaluation * batch_size * 3 + batch_index * 3 + pair_index
+    frame = frames[frame_index, DIAGNOSTIC_HEADER_HEIGHT:]
+    width = frame.shape[1] // 2
+    return frame[:, :width], frame[:, width:]
 
 
 def _enable_corrections(correction, count=1):
@@ -95,6 +103,42 @@ def test_blend_uses_strict_mean_rgb_threshold_and_unblurred_reference(anti_drift
     torch.testing.assert_close(restored_below, reference, rtol=0, atol=0)
     torch.testing.assert_close(restored, reference, rtol=0, atol=0)
     torch.testing.assert_close(kept, above_threshold, rtol=0, atol=0)
+
+
+def test_diagnostic_headers_label_stage_alignment_and_mask_state(anti_drift, monkeypatch):
+    labels = []
+    draw_image = anti_drift.ImageDraw.Draw
+
+    class DrawingProxy:
+        def __init__(self, image):
+            self.draw = draw_image(image)
+
+        def text(self, position, text, **kwargs):
+            labels.append(text)
+            self.draw.text(position, text, **kwargs)
+
+    monkeypatch.setattr(anti_drift.ImageDraw, "Draw", DrawingProxy)
+    image = torch.tensor(
+        [[[[ -0.25, 1.4, 0.5], [0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+          [[0.7, 0.8, 0.9], [1.25, -0.1, 0.2], [0.3, 0.4, 0.5]]]],
+        dtype=torch.float32,
+    )
+    mask = torch.zeros((1, 2, 3, 1), dtype=torch.bool)
+    frames = anti_drift.diagnostic_frames(
+        image, image, mask, mask, mask,
+        [(0.5, -1.25)], [True], ["redetected"], "Correction 2", True, sigma=0.125,
+    )
+    raw, _ = _diagnostic_pair(frames, 0, 0, 0, 1)
+    torch.testing.assert_close(raw, image[0], rtol=0, atol=0)
+
+    assert labels == [
+        "Correction 2 sigma=0.125 batch=0 align=on sample dy=+0.500 dx=-1.250 recalc=yes mask=redetected",
+        "raw decode | aligned raw (black uncovered)",
+        "Correction 2 sigma=0.125 batch=0 align=on sample dy=+0.500 dx=-1.250 recalc=yes mask=redetected",
+        "corrected composite | displayed feathered mask",
+        "Correction 2 sigma=0.125 batch=0 align=on sample dy=+0.500 dx=-1.250 recalc=yes mask=redetected",
+        "registration exclusion | binary edit mask",
+    ]
 
 
 def test_mask_expansion_default_is_15_pixels_and_batch_local(anti_drift):
@@ -553,7 +597,7 @@ def test_correction_normalizes_latents_caches_reference_and_restores_each_predic
         ([correction.models[0]], {"memory_required": 10, "minimum_memory_required": 4}),
     ]
     assert len(correction.intermediate_frames) == 2
-    assert correction.intermediate_frames[0].shape == (1, 2, 4, 3)
+    assert correction.intermediate_frames[0].shape == (3, 34, 4, 3)
 
 
 def test_correction_reuses_corrected_pixels_for_full_resolution_preview(
@@ -909,7 +953,7 @@ def test_sampler_returns_eval_major_corrected_and_feathered_mask_panels(
     assert len(decoded_inputs) == 3 and len(encoded_inputs) == 2
     assert final_image.shape == (batch, height, width, 3)
     assert final_image.dtype == torch.float32 and final_image.device.type == "cpu"
-    assert frames.shape == (4, height, width * 2, 3)
+    assert frames.shape == (3 * batch * 3, height + DIAGNOSTIC_HEADER_HEIGHT, width * 2, 3)
     assert frames.device.type == "cpu" and frames.dtype == torch.float32
     assert frames.data_ptr() != decoded_inputs[0].data_ptr()
 
@@ -928,11 +972,39 @@ def test_sampler_returns_eval_major_corrected_and_feathered_mask_panels(
     assert has_fractional_mask
 
     for index, (corrected, mask_rgb) in enumerate(expected_frames):
-        torch.testing.assert_close(frames[index, :, :width], corrected)
-        torch.testing.assert_close(frames[index, :, width:], mask_rgb)
+        evaluation, batch_index = divmod(index, batch)
+        raw_left, raw_right = _diagnostic_pair(frames, evaluation, batch_index, 0, batch)
+        composite, displayed_mask = _diagnostic_pair(frames, evaluation, batch_index, 1, batch)
+        exclusion, binary = _diagnostic_pair(frames, evaluation, batch_index, 2, batch)
+        torch.testing.assert_close(raw_left, predictions[evaluation][batch_index])
+        torch.testing.assert_close(raw_right, predictions[evaluation][batch_index])
+        torch.testing.assert_close(composite, corrected)
+        torch.testing.assert_close(displayed_mask, mask_rgb)
+        torch.testing.assert_close(binary[..., 0], binary[..., 1])
+        torch.testing.assert_close(binary[..., 1], binary[..., 2])
+        torch.testing.assert_close(exclusion[..., 0], exclusion[..., 1])
+        torch.testing.assert_close(exclusion[..., 1], exclusion[..., 2])
         torch.testing.assert_close(
-            frames[index, :, width:, 0], frames[index, :, width:, 1]
+            displayed_mask[..., 0], displayed_mask[..., 1]
         )
+        assert torch.all((binary == 0) | (binary == 1))
+        assert torch.all((exclusion == 0) | (exclusion == 1))
+        if evaluation == 0:
+            expected_detection = anti_drift.detect_mask(
+                predictions[evaluation][batch_index:batch_index + 1],
+                anti_drift.blur_image(reference[:1], 1), 10, 1,
+            )[0].to(binary.dtype)
+            torch.testing.assert_close(binary[..., :1], expected_detection)
+            torch.testing.assert_close(exclusion[..., :1], expected_detection)
+
+    final_eval = 2
+    for batch_index in range(batch):
+        raw_left, raw_right = _diagnostic_pair(frames, final_eval, batch_index, 0, batch)
+        composite, displayed_mask = _diagnostic_pair(frames, final_eval, batch_index, 1, batch)
+        torch.testing.assert_close(raw_left, predictions[final_eval][batch_index])
+        torch.testing.assert_close(raw_right, predictions[final_eval][batch_index])
+        torch.testing.assert_close(composite, final_image[batch_index])
+        assert displayed_mask.shape == (height, width, 3)
 
     stored_frames = frames.clone()
     predictions[0].fill_(0.0)
@@ -1004,12 +1076,17 @@ def test_sampler_delegates_once_with_advanced_controls_and_clears_correction(
     )
 
     assert result[0] is native_output
-    assert result[1].shape == (0, 0, 0, 3)
+    assert result[1].shape == (3, 2 + DIAGNOSTIC_HEADER_HEIGHT, 4, 3)
     assert result[2].shape == (1, 2, 2, 3)
     assert result[2].dtype == torch.float32 and result[2].device.type == "cpu"
     torch.testing.assert_close(result[2], torch.zeros_like(result[2]))
     assert vae.decode_calls == 1 and vae.encode_calls == 0
     assert result[1].dtype == torch.float32 and result[1].device.type == "cpu"
+    raw, aligned = _diagnostic_pair(result[1], 0, 0, 0, 1)
+    torch.testing.assert_close(raw, torch.zeros_like(raw))
+    torch.testing.assert_close(aligned, raw)
+    composite, _ = _diagnostic_pair(result[1], 0, 0, 1, 1)
+    torch.testing.assert_close(composite, result[2][0])
     assert anti_drift.EnvyKSamplerAdvancedAntiDrift.RETURN_TYPES == ("LATENT", "IMAGE", "IMAGE")
     assert anti_drift.EnvyKSamplerAdvancedAntiDrift.RETURN_NAMES[-1] == "final_image"
     assert len(calls) == 1
@@ -1331,7 +1408,8 @@ def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkey
     for _ in range(3):
         retained({"denoised": denoised, "model": Model(), "sigma": torch.tensor([1.0])})
     frames = torch.cat(retained.intermediate_frames)
-    masks = frames[:, :, width:, 0]
+    _, masks = _diagnostic_pair(frames, 2, 0, 1, batch_size=2)
+    masks = masks[..., 0]
 
     assert retained.retained_mask.dtype == torch.bool
     assert retained.retained_mask.shape == (2, height, width, 1)
@@ -1340,10 +1418,12 @@ def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkey
     assert not retained.retained_mask[1, 2, 2, 0]
     assert retained.retained_mask[1, 2, 8, 0]
     assert torch.count_nonzero(retained.retained_mask[0]) == 2
-    assert torch.count_nonzero(masks[4] - masks[2]) == 0
-    assert masks[2, 2, 2] == 1 and masks[2, 6, 7] == 1
-    assert masks[2, 2, 3] == 1 and masks[2, 2, 0] == 0
-    assert masks[2, 2, 2] == masks[2, 2, 2].round()
+    _, previous_masks = _diagnostic_pair(frames, 1, 0, 1, batch_size=2)
+    previous_masks = previous_masks[..., 0]
+    assert torch.count_nonzero(masks - previous_masks) == 0
+    assert masks[2, 2] == 1 and masks[6, 7] == 1
+    assert masks[2, 3] == 1 and masks[2, 0] == 0
+    assert masks[2, 2] == masks[2, 2].round()
 
     shrinking = anti_drift.AntiDriftCorrection(
         reference, VAE([first, next_prediction]), 0, 10, 1,
@@ -1352,10 +1432,12 @@ def test_dont_unmask_retains_unexpanded_binary_mask_per_batch(anti_drift, monkey
     _enable_corrections(shrinking, 2)
     for _ in range(2):
         shrinking({"denoised": denoised, "model": Model(), "sigma": torch.tensor([1.0])})
-    shrinking_masks = torch.cat(shrinking.intermediate_frames)[:, :, width:, 0]
-    assert shrinking_masks[0, 2, 2] == 1
-    assert shrinking_masks[2, 2, 2] == 0
-    assert shrinking_masks[2, 6, 7] == 1
+    shrinking_frames = torch.cat(shrinking.intermediate_frames)
+    _, first_mask = _diagnostic_pair(shrinking_frames, 0, 0, 1, batch_size=2)
+    _, second_mask = _diagnostic_pair(shrinking_frames, 1, 0, 1, batch_size=2)
+    assert first_mask[2, 2, 0] == 1
+    assert second_mask[2, 2, 0] == 0
+    assert second_mask[6, 7, 0] == 1
 
 
 def test_post_cfg_encodes_color_matched_prediction_over_exact_source_background(

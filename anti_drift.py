@@ -6,6 +6,7 @@ import re
 
 import torch
 import torch.nn.functional as F
+from PIL import Image, ImageDraw
 from torchvision.transforms.functional import gaussian_blur
 
 import comfy.model_management
@@ -85,10 +86,12 @@ def parse_correction_steps(value, steps):
     return result
 
 
-def alignment_offsets(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, previous_mask=None):
+def alignment_offsets(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, previous_mask=None, registration_masks=None):
     provisional = detect_mask(prediction, blurred_reference, threshold_percent, comparison_blur_pixels)
     if previous_mask is not None:
         provisional |= previous_mask
+    if registration_masks is not None:
+        registration_masks.append(provisional)
     return estimate_translation(reference, prediction, provisional)
 
 
@@ -106,7 +109,39 @@ def output_binary_mask(reference, prediction, blurred_reference, threshold_perce
     return binary, recalculate
 
 
-def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, align_background=True, dont_unmask_pixels=False):
+def diagnostic_frames(prediction, composite, display_mask, registration_mask, binary_mask, offsets, recalculate, mask_modes, stage, align_background, sigma=None):
+    prediction = prediction.detach().to(device="cpu", dtype=torch.float32, copy=True)
+    composite = composite.detach().to(device="cpu", dtype=torch.float32)
+    display_mask = display_mask.detach().to(device="cpu", dtype=torch.float32)
+    registration_mask = registration_mask.detach().to(device="cpu", dtype=torch.float32)
+    binary_mask = binary_mask.detach().to(device="cpu", dtype=torch.float32)
+    aligned, _ = warp_image(prediction, offsets)
+    batch, height, width, _ = prediction.shape
+    frames = torch.empty((batch * 3, height + 32, width * 2, 3), device="cpu", dtype=torch.float32)
+    panels = (
+        ("raw decode | aligned raw (black uncovered)", prediction, aligned),
+        ("corrected composite | displayed feathered mask", composite, display_mask),
+        ("registration exclusion | binary edit mask", registration_mask, binary_mask),
+    )
+    for index in range(batch):
+        dy, dx = offsets[index]
+        stage_label = stage
+        if sigma is not None:
+            stage_label += f" sigma={sigma:.6g}"
+        label = f"{stage_label} batch={index} align={'on' if align_background else 'off'} sample dy={dy:+.3f} dx={dx:+.3f} recalc={'yes' if recalculate[index] else 'no'} mask={mask_modes[index]}"
+        for panel_index, (title, left, right) in enumerate(panels):
+            frame = frames[index * 3 + panel_index]
+            header = Image.new("RGB", (width * 2, 32), (24, 24, 24))
+            draw = ImageDraw.Draw(header)
+            draw.text((2, 2), label, fill="white")
+            draw.text((2, 17), title, fill="white")
+            frame[:32].copy_(torch.frombuffer(bytearray(header.tobytes()), dtype=torch.uint8).reshape(32, width * 2, 3).float().div_(255))
+            frame[32:, :width].copy_(left[index])
+            frame[32:, width:].copy_(right[index].expand(height, width, 3))
+    return frames
+
+
+def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels=2.0, align_background=True, dont_unmask_pixels=False, diagnostic_output=None):
     if prediction.ndim != 4 or prediction.shape[-1] < 3:
         raise ValueError("Anti-Drift requires an image VAE that decodes to [batch, height, width, RGB].")
     prediction = prediction[..., :3].detach().to(device="cpu", dtype=torch.float32, copy=True)
@@ -114,10 +149,12 @@ def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_perce
     blurred_reference = blur_image(reference, comparison_blur_pixels) if align_background or binary_mask is None else None
     if binary_mask is not None:
         binary_mask = binary_mask.detach().to(device="cpu")
+    had_binary_mask = binary_mask is not None
     offsets = [(0, 0)] * prediction.shape[0]
+    registration_masks = [] if diagnostic_output is not None else None
     if align_background:
         previous_mask = None if binary_mask is None else feather_mask(binary_mask, blur_pixels, mask_expand_pixels, prediction.dtype) > 0
-        offsets = alignment_offsets(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, previous_mask)
+        offsets = alignment_offsets(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, previous_mask, registration_masks)
     recalculate = [math.hypot(dy, dx) > 1 / 3 for dy, dx in offsets]
     if binary_mask is None or any(recalculate):
         detected, recalculate = output_binary_mask(reference, prediction, blurred_reference, threshold_percent, comparison_blur_pixels, offsets)
@@ -128,12 +165,24 @@ def finalize_image(image1, prediction, binary_mask, blur_pixels, threshold_perce
                 elif dont_unmask_pixels:
                     detected[index] |= binary_mask[index]
         binary_mask = detected
+    mask_modes = []
+    for needs_recalculation in recalculate:
+        if not had_binary_mask:
+            mask_modes.append("detected")
+        elif not needs_recalculation:
+            mask_modes.append("reused")
+        else:
+            mask_modes.append("redetected+retained" if dont_unmask_pixels else "redetected")
     output_mask = feather_mask(binary_mask, blur_pixels, mask_expand_pixels, prediction.dtype)
     raw_mask = shift_mask(output_mask, [(-dy, -dx) for dy, dx in offsets], mode="bilinear")
     composite = compose_prediction(reference, prediction, raw_mask)
+    display_mask = output_mask
     if align_background:
         display_mask = shift_mask(raw_mask, offsets, mode="bilinear")
-        composite, _ = apply_translation(composite, offsets, reference, display_mask)
+        composite, display_mask = apply_translation(composite, offsets, reference, display_mask)
+    if diagnostic_output is not None:
+        registration_mask = registration_masks[0] if align_background else torch.zeros_like(binary_mask)
+        diagnostic_output.append(diagnostic_frames(prediction, composite, display_mask, registration_mask, binary_mask, offsets, recalculate, mask_modes, "Final", align_background))
     return composite
 
 
@@ -207,11 +256,13 @@ class AntiDriftCorrection:
                 self.blurred_reference = blur_image(self.reference, self.comparison_blur_pixels)
                 self.image1 = None
             offsets = [(0, 0)] * prediction.shape[0]
+            registration_masks = []
             if self.align_background:
                 previous_mask = None if self.last_binary_mask is None else feather_mask(self.last_binary_mask, self.blur_pixels, self.mask_expand_pixels, prediction.dtype) > 0
-                offsets = alignment_offsets(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, previous_mask)
-            binary_mask, _ = output_binary_mask(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, offsets)
-            if self.dont_unmask_pixels and self.retained_mask is not None:
+                offsets = alignment_offsets(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, previous_mask, registration_masks)
+            binary_mask, recalculate = output_binary_mask(self.reference, prediction, self.blurred_reference, self.threshold_percent, self.comparison_blur_pixels, offsets)
+            retained = self.dont_unmask_pixels and self.retained_mask is not None
+            if retained:
                 binary_mask |= self.retained_mask
             output_mask = feather_mask(binary_mask, self.blur_pixels, self.mask_expand_pixels, prediction.dtype)
             raw_mask = shift_mask(output_mask, [(-dy, -dx) for dy, dx in offsets], mode="bilinear")
@@ -228,11 +279,9 @@ class AntiDriftCorrection:
             if result.shape != denoised.shape:
                 raise ValueError(f"Anti-Drift VAE encoded latent shape {tuple(result.shape)} does not match the sampled latent shape {tuple(denoised.shape)}. Use the VAE matching the model and latent.")
             self.latest_preview = latent_preview.preview_to_image(corrected[0], do_scale=False)
-            batch, height, width, channels = corrected.shape
-            frame = torch.empty((batch, height, width * 2, channels), device="cpu", dtype=torch.float32)
-            frame[:, :, :width].copy_(corrected.detach())
-            frame[:, :, width:].copy_(mask.detach())
-            self.intermediate_frames.append(frame)
+            registration_mask = registration_masks[0] if self.align_background else torch.zeros_like(binary_mask, device="cpu")
+            modes = ["detected+retained" if retained else "detected"] * prediction.shape[0]
+            self.intermediate_frames.append(diagnostic_frames(prediction, corrected, mask, registration_mask, binary_mask, offsets, recalculate, modes, f"Correction {len(self.intermediate_frames) + 1}", self.align_background, sigma))
             comfy.model_management.load_models_gpu(self.models, memory_required=self.memory_required, minimum_memory_required=self.minimum_memory_required)
         return result
 
@@ -280,10 +329,11 @@ class EnvyKSamplerAdvancedAntiDrift(KSamplerAdvanced):
             result = super().sample(patched_model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, denoise=denoise)
             with comfy.model_prefetch.pause_malloc_graph():
                 prediction = vae.decode(result[0]["samples"])
-                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels, align_background, dont_unmask_pixels)
+                final_frames = []
+                final_image = finalize_image(image1, prediction, correction.last_binary_mask, blur_pixels, threshold_percent, mask_expand_pixels, comparison_blur_pixels, align_background, dont_unmask_pixels, diagnostic_output=final_frames)
             preview = latent_preview.preview_to_image(final_image[0], do_scale=False)
             comfy.utils.ProgressBar(steps).update_absolute(steps, steps, ("JPEG", preview, None))
-            intermediate_steps_and_masks = torch.cat(correction.intermediate_frames, dim=0) if correction.intermediate_frames else torch.empty((0, 0, 0, 3), device="cpu", dtype=torch.float32)
+            intermediate_steps_and_masks = torch.cat([*correction.intermediate_frames, *final_frames], dim=0)
             return result[0], intermediate_steps_and_masks, final_image
         finally:
             correction.clear()
