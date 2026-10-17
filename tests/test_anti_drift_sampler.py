@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 import types
 from contextlib import nullcontext
@@ -69,6 +70,52 @@ def _fractionally_translate(image, dy, dx):
     ).movedim(1, -1)
 
 
+def _scale_translate(image, sy, sx, dy, dx):
+    batch, height, width, _ = image.shape
+    y, x = torch.meshgrid(
+        torch.arange(height, dtype=image.dtype),
+        torch.arange(width, dtype=image.dtype),
+        indexing="ij",
+    )
+    grid = torch.stack((
+        ((x - dx) / sx + 0.5) * (2 / width) - 1,
+        ((y - dy) / sy + 0.5) * (2 / height) - 1,
+    ), dim=-1).expand(batch, -1, -1, -1)
+    return torch.nn.functional.grid_sample(
+        image.movedim(-1, 1), grid, mode="bilinear", padding_mode="zeros", align_corners=False
+    ).movedim(1, -1)
+
+
+def _max_corner_error(estimated, expected, height, width):
+    sy, sx, dy, dx = estimated
+    expected_sy, expected_sx, expected_dy, expected_dx = expected
+    return max(
+        math.hypot((sy - expected_sy) * y + dy - expected_dy,
+                   (sx - expected_sx) * x + dx - expected_dx)
+        for y in (0, height - 1)
+        for x in (0, width - 1)
+    )
+
+
+def _analytic_texture_at(y, x):
+    return torch.stack((
+        0.5 + 0.14 * torch.sin(0.043 * y + 0.017 * x) + 0.12 * torch.cos(0.019 * y - 0.057 * x) + 0.06 * torch.sin(0.11 * y + 0.09 * x),
+        0.5 + 0.13 * torch.sin(0.031 * y - 0.013 * x) + 0.11 * torch.cos(0.061 * y + 0.023 * x) + 0.05 * torch.sin(0.08 * y - 0.12 * x),
+        0.5 + 0.12 * torch.sin(0.052 * y + 0.029 * x) + 0.13 * torch.cos(0.027 * y - 0.047 * x) + 0.04 * torch.sin(0.13 * y + 0.07 * x),
+    ), dim=-1)
+
+
+def _analytic_texture(height, width):
+    y, x = torch.meshgrid(torch.arange(height).float(), torch.arange(width).float(), indexing="ij")
+    return _analytic_texture_at(y, x)[None]
+
+
+def _analytic_raw_for_alignment(height, width, transform):
+    sy, sx, dy, dx = transform
+    y, x = torch.meshgrid(torch.arange(height).float(), torch.arange(width).float(), indexing="ij")
+    return _analytic_texture_at((y - dy) / sy, (x - dx) / sx)[None]
+
+
 @pytest.fixture(scope="module")
 def anti_drift():
     import comfy.cli_args
@@ -105,7 +152,8 @@ def test_blend_uses_strict_mean_rgb_threshold_and_unblurred_reference(anti_drift
     torch.testing.assert_close(kept, above_threshold, rtol=0, atol=0)
 
 
-def test_diagnostic_headers_label_stage_alignment_and_mask_state(anti_drift, monkeypatch):
+@pytest.mark.parametrize("use_ecc,method_label", [(False, "patch fit"), (True, "ECC")])
+def test_diagnostic_headers_label_stage_alignment_and_mask_state(anti_drift, monkeypatch, use_ecc, method_label):
     labels = []
     draw_image = anti_drift.ImageDraw.Draw
 
@@ -126,17 +174,17 @@ def test_diagnostic_headers_label_stage_alignment_and_mask_state(anti_drift, mon
     mask = torch.zeros((1, 2, 3, 1), dtype=torch.bool)
     frames = anti_drift.diagnostic_frames(
         image, image, mask, mask, mask,
-        [(0.5, -1.25)], [True], ["redetected"], "Correction 2", True, sigma=0.125,
+        [(1.0, 1.0, 0.5, -1.25)], [True], ["redetected"], "Correction 2", True, use_ecc, sigma=0.125,
     )
     raw, _ = _diagnostic_pair(frames, 0, 0, 0, 1)
     torch.testing.assert_close(raw, image[0], rtol=0, atol=0)
 
     assert labels == [
-        "Correction 2 sigma=0.125 batch=0 align=on sample dy=+0.500 dx=-1.250 recalc=yes mask=redetected",
+        f"Correction 2 sigma=0.125 batch=0 align={method_label} sx=1.00000 sy=1.00000 dx=-1.250 dy=+0.500 recalc=yes mask=redetected",
         "raw decode | aligned raw (black uncovered)",
-        "Correction 2 sigma=0.125 batch=0 align=on sample dy=+0.500 dx=-1.250 recalc=yes mask=redetected",
+        f"Correction 2 sigma=0.125 batch=0 align={method_label} sx=1.00000 sy=1.00000 dx=-1.250 dy=+0.500 recalc=yes mask=redetected",
         "corrected composite | displayed feathered mask",
-        "Correction 2 sigma=0.125 batch=0 align=on sample dy=+0.500 dx=-1.250 recalc=yes mask=redetected",
+        f"Correction 2 sigma=0.125 batch=0 align={method_label} sx=1.00000 sy=1.00000 dx=-1.250 dy=+0.500 recalc=yes mask=redetected",
         "registration exclusion | binary edit mask",
     ]
 
@@ -260,6 +308,7 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     assert schema["comparison_blur_pixels"][1]["default"] == 2.0
     all_inputs = {**schema, **anti_drift.EnvyKSamplerAdvancedAntiDrift.INPUT_TYPES().get("optional", {})}
     assert all_inputs["align_background"][1]["default"] is True
+    assert all_inputs["use_ecc_alignment"][1]["default"] is False
     assert "align_background" in anti_drift.EnvyKSamplerAdvancedAntiDrift.INPUT_TYPES()["optional"]
     assert "feather" in schema["blur_pixels"][1]["tooltip"].lower()
     assert "detection only" in schema["comparison_blur_pixels"][1]["tooltip"].lower()
@@ -270,159 +319,151 @@ def test_blur_zero_and_default_blur_are_finite_on_tiny_images(anti_drift):
     assert defaults.dont_unmask_pixels is False
     assert defaults.comparison_blur_pixels == 2.0
     assert defaults.align_background is True
+    assert defaults.use_ecc_alignment is False
 
 
-@pytest.mark.parametrize("dy,dx", [(5, -4), (-5, 4)])
-def test_registration_recovers_signed_translation_from_unmasked_background(
-    anti_drift, dy, dx
-):
-    height = width = 192
-    reference = _textured_image(height, width, seed=9)
-    edited = reference.clone()
-    conflict = _textured_image(height, width, seed=22) * 2
-    edited[:, 60:132, 60:132] = conflict[:, 60:132, 60:132]
-    prediction = _translate(edited, dy, dx)
-    edit_mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
-    edit_mask[:, 48:144, 48:144] = True
+@pytest.mark.parametrize("method", ["patch", "ecc"])
+@pytest.mark.parametrize("sy,sx,dy,dx", [(1.018, 0.986, 2.4, -3.2), (0.982, 1.014, -2.2, 3.1)])
+@pytest.mark.parametrize("height,width", [(224, 240), (215, 281)])
+def test_alignment_recovers_independent_scales_and_signed_offsets(anti_drift, method, sy, sx, dy, dx, height, width):
+    reference = _analytic_texture(height, width)
+    # A mild color transfer keeps normalized correlation useful while testing
+    # registration independently of the final background color match.
+    prediction = _analytic_raw_for_alignment(height, width, (sy, sx, dy, dx)) * 1.17 + 0.06
+    exclusion = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    exclusion[:, 70:150, 78:162] = True
+    unedited_prediction = prediction.clone()
+    conflict = _textured_image(height, width, seed=22) * 1.4
+    prediction[:, 70:150, 78:162] = conflict[:, 70:150, 78:162]
 
-    offsets = anti_drift.estimate_translation(reference, prediction, edit_mask)
+    transform = anti_drift.estimate_alignment(reference, prediction, exclusion, method=method)
+    assert _max_corner_error(transform[0], (sy, sx, dy, dx), height, width) < 0.5, (transform[0], (sy, sx, dy, dx))
+    unmasked_transform = anti_drift.estimate_alignment(reference, unedited_prediction, exclusion, method=method)
+    assert _max_corner_error(transform[0], unmasked_transform[0], height, width) < 0.05
 
-    assert offsets == [(dy, dx)]
-    aligned, coverage = anti_drift.warp_image(prediction, offsets)
-    background = (coverage > 0.999) & ~edit_mask
-    assert background.sum() > 1000
-    torch.testing.assert_close(
-        aligned[background.expand_as(aligned)],
-        reference[background.expand_as(reference)],
-        rtol=0,
-        atol=1e-6,
+    aligned, coverage = anti_drift.warp_image(prediction, transform)
+    valid = (coverage > 0.999) & ~exclusion
+    before = anti_drift.match_background_color(prediction, reference, exclusion)
+    after = anti_drift.match_background_color(aligned, reference, exclusion)
+    before = (before - reference).abs()[valid.expand_as(reference)].mean()
+    after = (after - reference).abs()[valid.expand_as(reference)].mean()
+    assert valid.sum() > 1000
+    assert after < before * 0.6
+
+
+@pytest.mark.parametrize("method", ["patch", "ecc"])
+def test_alignment_flat_or_fully_excluded_background_is_identity(anti_drift, method):
+    flat = torch.full((1, 192, 208, 3), 0.4)
+    exclusion = torch.ones((1, 192, 208, 1), dtype=torch.bool)
+    assert anti_drift.estimate_alignment(flat, flat.clone(), method=method) == [(1.0, 1.0, 0.0, 0.0)]
+    assert anti_drift.estimate_alignment(flat, flat.clone(), exclusion, method=method) == [(1.0, 1.0, 0.0, 0.0)]
+
+
+def test_alignment_rejects_unknown_method_instead_of_using_another_estimator(anti_drift):
+    image = _analytic_texture(64, 72)
+    with pytest.raises(ValueError, match="Unknown background alignment method"):
+        anti_drift.estimate_alignment(image, image, method="unknown")
+
+
+def test_ecc_ignores_invalid_registration_support_and_uses_remaining_patches(anti_drift):
+    height, width = 224, 280
+    reference = _textured_image(height, width, seed=27)
+    target_transform = (1.012, 0.989, 2.3, -3.6)
+    prediction = _scale_translate(reference, *target_transform)
+    exclusion = torch.ones((1, height, width, 1), dtype=torch.bool)
+    exclusion[:, 12:112, 18:125] = False
+    exclusion[:, 112:212, 155:262] = False
+
+    transform = anti_drift.estimate_alignment(reference, prediction, exclusion, method="ecc")
+
+    assert _max_corner_error(transform[0], target_transform, height, width) < 0.5
+    aligned, coverage = anti_drift.warp_image(prediction, transform)
+    valid = (coverage > 0.999) & ~exclusion
+    before = (prediction - reference).abs()[valid.expand_as(reference)].mean()
+    after = (aligned - reference).abs()[valid.expand_as(reference)].mean()
+    assert after < before * 0.3
+
+
+@pytest.mark.parametrize("method", ["patch", "ecc"])
+def test_alignment_keeps_independent_batch_transforms_and_max_corner_displacement(anti_drift, method):
+    height, width = 192, 208
+    reference = _analytic_texture(height, width)
+    transforms = [(1.0, 1.0, 5.0, -4.0), (1.0, 1.0, -5.0, 4.0), (1.0, 1.0, 3.0, -2.0)]
+    prediction = torch.cat([_analytic_raw_for_alignment(height, width, transform) for transform in transforms])
+    estimated = anti_drift.estimate_alignment(reference, prediction, method=method)
+    assert len(estimated) == 3
+    for got, wanted in zip(estimated, transforms):
+        assert _max_corner_error(got, wanted, height, width) < 0.5, (got, wanted)
+    assert anti_drift.alignment_displacement(estimated, height, width) == pytest.approx(
+        [math.hypot(5, 4), math.hypot(5, 4), math.hypot(3, 2)], abs=0.2
     )
 
 
-def test_alignment_bootstraps_a_first_pass_without_an_existing_mask(anti_drift):
-    height = width = 192
-    reference = _textured_image(height, width, seed=15)
-    edited = reference.clone()
-    edit_mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
-    edit_mask[:, 48:144, 48:144] = True
-    edited[:, 48:144, 48:144] = 0.95
-    prediction = _translate(edited, 2, -2)
-
-    offsets = anti_drift.alignment_offsets(
-        reference, prediction, anti_drift.blur_image(reference, 2), 5, 2
+def test_alignment_displacement_uses_max_corner_and_threshold_is_batch_local(anti_drift):
+    reference = _textured_image(192, 208, seed=103)
+    prediction = torch.cat((_fractionally_translate(reference, 0, 0.2), _fractionally_translate(reference, 0, 0.4)))
+    transforms = [(1.001, 1.0, 0.0, 0.0), (1.0, 1.0, 0.4, 0.0)]
+    displacements = anti_drift.alignment_displacement(transforms, 192, 208)
+    assert displacements == pytest.approx([191 * 0.001, 0.4], abs=1e-6)
+    assert anti_drift.alignment_displacement([(1.01, 0.99, 0.0, 0.0)], 192, 208) == pytest.approx(
+        [math.hypot(191 * 0.01, 207 * 0.01)], abs=1e-6
     )
-    aligned, coverage = anti_drift.warp_image(prediction, offsets)
-
-    assert offsets[0] == pytest.approx((2.0, -2.0), abs=0.05)
-    background = (coverage > 0.999) & ~edit_mask
-    assert background.sum() > 1000
-    torch.testing.assert_close(
-        aligned[background.expand_as(aligned)],
-        reference[background.expand_as(reference)],
-        rtol=0,
-        atol=0.02,
+    masks, recalculate = anti_drift.output_binary_mask(
+        reference, prediction, anti_drift.blur_image(reference, 0), 0.5, 0, transforms
     )
+    assert masks.shape == (2, 192, 208, 1)
+    assert recalculate == [False, True]
 
 
-def test_registration_leaves_no_shift_flat_and_ambiguous_images_unchanged(anti_drift):
-    textured = _textured_image(192, 192, seed=31)
-    flat = torch.full_like(textured, 0.4)
-    stripes = (torch.arange(192) % 8).float().div(8).reshape(1, 1, 192, 1)
-    ambiguous = stripes.expand(1, 192, 192, 3).clone()
+def test_alignment_inverse_mask_roundtrip_and_integer_warp_preserve_dtype(anti_drift):
+    height, width = 40, 48
+    image = torch.arange(height * width * 3, dtype=torch.float64).reshape(1, height, width, 3)
+    transform = [(1.0, 1.0, 3.0, -4.0)]
+    warped, coverage = anti_drift.warp_image(image, transform)
+    assert warped.dtype == image.dtype
+    torch.testing.assert_close(warped[0, 5, 8], image[0, 8, 4], rtol=0, atol=0)
+    assert coverage.dtype == torch.float64
+    binary = torch.zeros((1, height, width, 1), dtype=torch.bool)
+    binary[:, 16:20, 18:23] = True
+    moved = anti_drift.shift_mask(binary, transform)
+    assert moved.dtype == torch.bool
+    restored = anti_drift.shift_mask(moved, anti_drift.invert_alignment(transform))
+    assert torch.equal(restored[:, 3:-3, 4:-4], binary[:, 3:-3, 4:-4])
 
-    for image in (textured, flat, ambiguous):
-        assert anti_drift.estimate_translation(image, image.clone()) == [(0, 0)]
 
-    # Periodic stripes have equally good nonzero translations, so they cannot
-    # identify a unique shift.
-    periodic_reference = torch.roll(ambiguous, shifts=4, dims=2)
-    assert anti_drift.estimate_translation(periodic_reference, ambiguous) == [(0, 0)]
-
-
-def test_subpixel_estimates_recalculate_masks_only_above_one_third_pixel(anti_drift):
-    reference = _textured_image(192, 192, seed=103)
-    generator = torch.Generator().manual_seed(104)
-    fine_texture = torch.rand(reference.shape, generator=generator) * 0.04 - 0.02
-    reference = (reference + fine_texture).clamp(0, 1)
+@pytest.mark.parametrize("method", ["patch", "ecc"])
+def test_subpixel_alignment_recalculates_masks_at_one_third_pixel_per_batch(anti_drift, method):
+    height, width = 192, 208
+    reference = _analytic_texture(height, width)
     prediction = torch.cat((
-        _fractionally_translate(reference, 0.0, 0.2),
-        _fractionally_translate(reference, 0.0, 0.4),
+        _analytic_raw_for_alignment(height, width, (1.0, 1.0, 0.0, 0.2)),
+        _analytic_raw_for_alignment(height, width, (1.0, 1.0, 0.0, 0.4)),
     ))
-    offsets = anti_drift.estimate_translation(reference, prediction)
-    assert offsets[0] == pytest.approx((0.0, 0.2), abs=0.12)
-    assert offsets[1] == pytest.approx((0.0, 0.4), abs=0.12)
+    transforms = anti_drift.estimate_alignment(reference, prediction, method=method)
+    assert _max_corner_error(transforms[0], (1.0, 1.0, 0.0, 0.2), height, width) < 0.5, transforms
+    assert _max_corner_error(transforms[1], (1.0, 1.0, 0.0, 0.4), height, width) < 0.5, transforms
+    assert [value > 1 / 3 for value in anti_drift.alignment_displacement(transforms, height, width)] == [False, True], transforms
 
     masks, recalculate = anti_drift.output_binary_mask(
-        reference, prediction, anti_drift.blur_image(reference, 0), 0.5, 0, offsets
+        reference, prediction, anti_drift.blur_image(reference, 0), 0.5, 0, transforms
     )
-    raw_mask = anti_drift.detect_mask(
-        prediction, anti_drift.blur_image(reference, 0), 0.5, 0
-    )
-
     assert recalculate == [False, True]
-    assert masks.shape == (2, 192, 192, 1)
-    raw_false_positives = raw_mask[1, 32:160, 32:160].sum()
-    aligned_false_positives = masks[1, 32:160, 32:160].sum()
-    assert raw_false_positives > aligned_false_positives
+    assert masks.shape == (2, height, width, 1)
 
 
-def test_registration_does_not_use_content_inside_the_edit_mask(anti_drift):
-    height = width = 192
-    reference = _textured_image(height, width, seed=41)
-    mask = torch.zeros((1, height, width, 1), dtype=torch.bool)
-    mask[:, 40:152, 40:152] = True
-    prediction = _textured_image(height, width, seed=74)
-    shifted_reference = _translate(reference, 6, -5)
-    prediction[:, 48:144, 48:144] = shifted_reference[:, 48:144, 48:144]
-
-    assert anti_drift.estimate_translation(reference, prediction, mask) == [(0, 0)]
-
-
-def test_registration_is_batch_local_and_edge_fill_uses_valid_histogram_support(
-    anti_drift
-):
-    height = width = 192
-    reference = _textured_image(height, width, seed=83)
-    transform = torch.tensor([1.25, 1.1, 1.35]).reshape(1, 1, 1, 3)
-    offset = torch.tensor([0.06, 0.08, 0.04]).reshape(1, 1, 1, 3)
-    colored = reference * transform + offset
-    prediction = torch.cat((_translate(colored, 5, -4), _translate(colored, -5, 4)))
-
-    offsets = anti_drift.estimate_translation(reference, prediction)
-    aligned, coverage = anti_drift.warp_image(prediction, offsets)
-    assert offsets == [(5, -4), (-5, 4)]
-    assert coverage.shape == (2, height, width, 1)
-    assert not coverage.all()
-    for batch_index in range(2):
-        overlap = (coverage[batch_index] > 0.999).expand_as(reference[0])
-        torch.testing.assert_close(
-            aligned[batch_index][overlap], colored[0][overlap], rtol=0, atol=0
-        )
-    composite, _ = anti_drift.apply_translation(
-        prediction, offsets, reference, torch.zeros((2, height, width, 1))
-    )
-    for batch_index, column in ((0, 0), (1, -1)):
-        matched = anti_drift.match_background_color(
-            reference, aligned[batch_index:batch_index + 1],
-            (coverage[batch_index:batch_index + 1] > 0.999).logical_not(),
-        )
-        torch.testing.assert_close(
-            composite[batch_index, 80, column], matched[0, 80, column], rtol=0, atol=1e-6
-        )
-
-
-def test_registration_feathers_exposed_edge_and_fills_holes_from_source(
-    anti_drift
-):
+def test_apply_alignment_fills_and_feathers_exposed_edge(anti_drift):
     height, width = 20, 24
     reference = torch.zeros((1, height, width, 3))
     reference[:] = torch.tensor([0.2, 0.3, 0.4])
     generated = torch.empty_like(reference)
     generated[:] = torch.tensor([0.7, 0.8, 0.9])
     prediction = _translate(generated, 0, 3)
+    transform = [(1.0, 1.0, 0.0, 3.0)]
+    raw_mask = torch.ones((1, height, width, 1))
+    displayed_mask = anti_drift.shift_mask(raw_mask, transform, mode="bilinear")
 
-    aligned, displayed_mask = anti_drift.apply_translation(
-        prediction, [(0, 3)], reference, torch.ones((1, height, width, 1))
+    aligned, displayed_mask = anti_drift.apply_alignment(
+        prediction, transform, reference, displayed_mask
     )
 
     torch.testing.assert_close(aligned[0, 8, width - 4], torch.tensor([0.36666667, 0.46666667, 0.56666667]))
@@ -431,6 +472,25 @@ def test_registration_feathers_exposed_edge_and_fills_holes_from_source(
     torch.testing.assert_close(displayed_mask[0, 8, width - 4, 0], torch.tensor(1 / 3))
     torch.testing.assert_close(displayed_mask[0, 8, width - 5, 0], torch.tensor(2 / 3))
     assert not displayed_mask[0, 8, width - 3:, 0].any()
+
+
+def test_fractional_alignment_of_flat_colors_has_no_dark_edge_seam(anti_drift):
+    height, width = 31, 37
+    reference = torch.full((1, height, width, 3), 0.2)
+    prediction = torch.full_like(reference, 0.7)
+    transform = [(1.0, 1.0, 0.35, -0.6)]
+    raw_mask = torch.ones((1, height, width, 1))
+    displayed_mask = anti_drift.shift_mask(raw_mask, transform, mode="bilinear")
+
+    aligned, displayed_mask = anti_drift.apply_alignment(
+        prediction, transform, reference, displayed_mask
+    )
+
+    assert torch.isfinite(aligned).all()
+    assert aligned.min() >= 0.2
+    assert aligned.max() <= 0.700001
+    assert displayed_mask.min() >= 0
+    assert displayed_mask.max() <= 1
 
 
 def test_final_alignment_moves_restored_background_and_edit_once(anti_drift):
@@ -496,20 +556,21 @@ def test_corrections_retain_display_mask_across_offsets_without_extra_vae_calls(
     correction.memory_required = 1
     correction.minimum_memory_required = 1
     estimated_offsets = []
-    estimate = anti_drift.alignment_offsets
+    estimate = anti_drift.alignment_transforms
 
     def capture_offsets(*args, **kwargs):
         offsets = estimate(*args, **kwargs)
         estimated_offsets.append(offsets)
         return offsets
 
-    monkeypatch.setattr(anti_drift, "alignment_offsets", capture_offsets)
+    monkeypatch.setattr(anti_drift, "alignment_transforms", capture_offsets)
     args = {"denoised": torch.zeros((1, 4, 2, 2)), "model": Model(), "sigma": torch.tensor([1.0])}
     correction(args)
     first_mask = correction.last_binary_mask.clone()
     correction(args)
 
-    assert estimated_offsets == [[(5, -4)], [(-3, 2)]]
+    assert estimated_offsets[0][0] == pytest.approx((1.0, 1.0, 5, -4), abs=0.05)
+    assert estimated_offsets[1][0] == pytest.approx((1.0, 1.0, -3, 2), abs=0.05)
     assert len(decoded) == len(encoded) == 2
     assert first_mask[0, 90, 90, 0]
     assert correction.last_binary_mask[0, 90, 90, 0]
@@ -527,7 +588,7 @@ def test_disabled_alignment_keeps_the_legacy_final_composite(anti_drift, monkeyp
     def unexpected_alignment(*args, **kwargs):
         raise AssertionError("disabled alignment must not register the prediction")
 
-    monkeypatch.setattr(anti_drift, "alignment_offsets", unexpected_alignment)
+    monkeypatch.setattr(anti_drift, "alignment_transforms", unexpected_alignment)
     final = anti_drift.finalize_image(
         reference, prediction, mask, 0, 5, 0, align_background=False
     )
